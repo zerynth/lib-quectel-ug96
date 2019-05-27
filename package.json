@@ -1,0 +1,21 @@
+{
+    "dependencies": {},
+    "description": "Driver for Quectel UG96 GSM modems",
+    "fullname": "lib.quectel.ug96",
+    "git_pointer": "zerynth://zerynth-libs/quectel-ug96",
+    "info": {
+        "chip_manufacturer": "Quectel",
+        "chip_name": "UG96",
+        "name": "GSM/GPRS Driver",
+        "type": "Connectivity"
+    },
+    "keywords": [
+        "wireless",
+        "gsm",
+        "quectel"
+    ],
+    "repo": "official",
+    "title": "Quectel UG96 GSM modems",
+    "version": "r2.2.0",
+    "whatsnew": ""
+}

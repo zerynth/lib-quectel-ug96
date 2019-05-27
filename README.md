@@ -1,1 +1,0 @@
-# lib-quectel-ug96
