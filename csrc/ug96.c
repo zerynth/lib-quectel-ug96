@@ -161,8 +161,7 @@ int _gs_poweron(){
     vosThSleep(TIME_U(1000,MILLIS));  //wait for stabilization
     vhalPinWrite(gs.poweron,0);
     vosThSleep(TIME_U(1000,MILLIS));  // >= 500ms
-    vhalPinWrite(gs.poweron,1);
-    for(i=0;i<1000;i++){
+    for(i=0;i<150;i++){
         if(_gs_power_status_on()) {
             //status at 1, exit
             printf("Up!\n");
@@ -251,7 +250,7 @@ int _gs_read(int bytes){
     if (bytes<=0) bytes = vhalSerialAvailable(gs.serial);
     vhalSerialRead(gs.serial,gs.buffer,bytes);
     gs.bytes = bytes;
-    gs.buffer[gs.bytes+1]=0;
+    gs.buffer[gs.bytes+1]=0; // WATCH THIS!!
     // printf("rn: %s||\n",gs.buffer);
     return gs.bytes;
 }
@@ -352,6 +351,30 @@ uint8_t* _gs_advance_to(uint8_t *buf,uint8_t *ebuf,uint8_t *pattern){
 }
 
 /**
+ * @brief scans buf for bytes contained in pattern
+ *
+ * @param[in] buf       where to start the scan
+ * @param[in] ebuf      where to end the scan
+ * @param[in] pattern   characters to stop to
+ *
+ * @return a pointer to the location of one of the bytes in pattern or NULL if they cannot be found
+ */
+uint8_t* _gs_findstr(uint8_t *buf,uint8_t *ebuf,uint8_t *pattern){
+    uint8_t *pt;
+    while(buf<ebuf){
+        pt = pattern;
+        while(*pt && buf<ebuf) {
+            if(*buf!=*pt) break;
+            pt++;
+            buf++;
+        }
+        if (!*pt) return buf;
+        buf++;
+    }
+    return NULL;
+}
+
+/**
  * @brief parse numbers in base 10 from a byte buffe 
  *
  * Does not check for number format correctness (0003 is ok) and
@@ -422,12 +445,16 @@ int _gs_parse_command_arguments(uint8_t *buf, uint8_t *ebuf, const char*fmt,...)
                 if(!pms) goto exit;
                 ret++;
             break;
+            case 'S': // remove quotes if present
+                if (*pms == '\"') pms++;
+                if (*pme == '\"') pme--;
+                // fall down
             case 's':
                 sparam = va_arg(vl,uint8_t**);
                 iparam = va_arg(vl,int32_t*);
                 if(sparam) *sparam = pms;
                 // *buf=0; //end string
-                if(iparam) *iparam = (pme-pms)+1; //store len
+                if(iparam) *iparam = pme-pms+1; //store len
                 ret++;
                 break;
         }
@@ -500,6 +527,38 @@ void _gs_send_at(int cmd_id,const char *fmt,...){
     va_end(vl);
 }
 
+int _gs_wait_for_pin_ready() {
+    int i;
+    for(i=10;i>0;--i) {
+        vhalSerialWrite(gs.serial,"AT+CPIN?\r\n",10);
+        while(_gs_readline(1000)>=0){
+            if(_gs_findstr(gs.buffer,gs.buffer+gs.bytes,"READY")){
+                if(!_gs_wait_for_ok(500)) continue;
+                i = -1;
+                break;
+            }
+        }
+    }
+    return (i < 0);
+}
+
+int _gs_get_activity_status() {
+    uint8_t *p;
+    int32_t pas = -1; // unexpected/unknown
+    int i;
+
+    vhalSerialWrite(gs.serial,"AT+CPAS\r\n",9);
+    for(i=10;i>0;--i) {
+        if(_gs_readline(100)>=0){
+            p = _gs_findstr(gs.buffer,gs.buffer+gs.bytes,"+CPAS:"); 
+            if(p && _gs_parse_number(p,gs.buffer+gs.bytes,&pas))
+                break;
+        }
+    }
+    if(!_gs_wait_for_ok(500)) return -1;
+    return pas;
+}
+
 /**
  * @brief Configure basic parameters for startup
  *
@@ -529,17 +588,27 @@ int _gs_config0(){
     _gs_send_at(GS_CMD_CMEE,"=i",2);
     if(!_gs_wait_for_ok(500)) return 0;
     
-    //enable urc about network statu
+    //enable urc about network status
     _gs_send_at(GS_CMD_CREG,"=i",2);
     if(!_gs_wait_for_ok(500)) return 0;
     
     //display product ID
     vhalSerialWrite(gs.serial,"ATI\r\n",5);
     if(!_gs_wait_for_ok(500)) return 0;
-
+    // wait for PIN ready
+    if (!_gs_wait_for_pin_ready()) return 0;
+    // wait for ME ready
+    for(i=60;i>0;--i) {
+        int pas = _gs_get_activity_status();
+        if (pas < 0) return 0;
+        if (pas==0|pas==3|pas==4) break;
+        vosThSleep(TIME_U(1000,MILLIS));
+        //vhalKickWatchdog();
+    }
+    if (i == 0) return 0;
     //timezone update
     vhalSerialWrite(gs.serial,"AT+CTZU=1\r\n",11);
-    if(!_gs_wait_for_ok(500)) return 0;
+    if(!_gs_wait_for_ok(1500)) return 0;
 
     //set sms format
     vhalSerialWrite(gs.serial,"AT+CMGF=1\r\n",11);
@@ -739,8 +808,9 @@ int _gs_wait_for_slot_mode(uint8_t *text, int32_t textlen,uint8_t* addtxt, int a
     }
 
     if(gs.mode!=GS_MODE_PROMPT) return -1;
-    printf("Slot wait mode\n");
-    printf("-->%s\n",text);
+    printf("Slot wait mode\n-->");
+    print_buffer(text,textlen);
+    printf("\n");
 
     while(textlen>0){
         cnt = MIN(64,textlen);
@@ -854,7 +924,7 @@ void _gs_slot_ok(){
  */
 void _gs_slot_error(){
     printf("error slot %s\n",gs.slot->cmd->body);
-    gs.slot->err = 2;
+    gs.slot->err = GS_ERR_INVALID;
     gs.slot = NULL;
     vosSemSignal(gs.slotdone);
 }
@@ -902,7 +972,7 @@ void _gs_slot_params(GSCmd *cmd){
 void _gs_loop(void *args){
     (void)args;
     GSCmd *cmd;
-    printf("_gs_loop started\n");
+    printf("_gs_loop started (Thread %d)\n", vosThGetId(vosThCurrent()));
     while (gs.initialized){
         if(!gs.talking) {
             //ignore if serial is not active
@@ -1202,7 +1272,7 @@ int _gs_ssl_cfg(int op, int ctx, int val) {
             _gs_send_at(GS_CMD_QSSLCFG,"=\"s\",i,3","sslversion",10,ctx);  //select TLS 1.2 only
             break;
         case 1:
-            _gs_send_at(GS_CMD_QSSLCFG,"=\"s\",i,0x0035","ciphersuite",11,ctx);  //select all secure ciphersuites
+            _gs_send_at(GS_CMD_QSSLCFG,"=\"s\",i,\"0XFFFF\"","ciphersuite",11,ctx);  //select all secure ciphersuites
             break;
         case 2:
             _gs_send_at(GS_CMD_QSSLCFG,"=\"s\",i,\"s\"","cacert",6,ctx,f_cacert,11);  //select cacert
@@ -1243,7 +1313,7 @@ int _gs_socket_tls(int id, uint8_t* cacert, int cacertlen, uint8_t* clicert, int
     vosSemWait(sock->lock);
 
     res+=_gs_ssl_cfg(0,ctx,3); //TLS 1.2
-    // res+=_gs_ssl_cfg(1,ctx,0); //all ciphers
+    res+=_gs_ssl_cfg(1,ctx,0); //all ciphers
 
     if(cacert && cacertlen) {
         f_cacert[10]='0'+id;
@@ -1477,6 +1547,7 @@ int _gs_socket_send(int id, uint8_t* buf, int len) {
         _gs_wait_for_slot();
         if(slot->err) {
            res = -1; 
+            _gs_socket_closing(id);
         } else {
             //check resp
             if (memcmp(slot->resp,"SEND FAIL",9)==0) {
@@ -1874,12 +1945,20 @@ int _gs_check_network(){
     _gs_send_at(GS_CMD_CREG,"?");
     _gs_wait_for_slot();
 
-    if(_gs_parse_command_arguments(slot->resp,slot->eresp,"iissi",&p0,&p1,&s0,&l0,&s1,&l1,&p2)!=5) {
+    if(_gs_parse_command_arguments(slot->resp,slot->eresp,"iiSSi",&p0,&p1,&s0,&l0,&s1,&l1,&p2)!=5) {
+        memset(gs.lac, 0, 10);
+        memset(gs.ci, 0, 10);
         _gs_release_slot(slot);
-        return 0;
+        return -1;
     } else {
-        memcpy(gs.lac,s0+1,l0-2);
-        memcpy(gs.ci,s1+1,l1-2);
+        l0=MIN(9,l0);
+        memcpy(gs.lac,s0,l0);
+        gs.lac[l0] = 0;
+        
+        l1=MIN(9,l1);
+        memcpy(gs.ci,s1,l1);
+        gs.ci[l1] = 0;
+        
         gs.tech=p2;
     }
     _gs_release_slot(slot);
@@ -2019,14 +2098,15 @@ int _gs_imei(uint8_t *imei){
     if (!slot->err) {
         if(_gs_parse_command_arguments(slot->resp,slot->eresp,"s",&s0,&l0)!=1) {
             res = 0;
-        } else {
-            res = l0;
-            if (s0) memcpy(imei,s0,MIN(16,l0));
+        } else if (s0) {
+            res = MIN(16,l0);
+            memcpy(imei,s0,res);
         }
     }
     _gs_release_slot(slot);
     return res;
 }
+
 int _gs_iccid(uint8_t* iccid){
     int res=-1;
     int l0;
@@ -2038,9 +2118,9 @@ int _gs_iccid(uint8_t* iccid){
     if (!slot->err) {
         if(_gs_parse_command_arguments(slot->resp,slot->eresp,"s",&s0,&l0)!=1) {
             res = 0;
-        } else {
-            res = l0;
-            if (s0) memcpy(iccid,s0,MIN(22,l0));
+        } else if (s0) {
+            res = MIN(22,l0);
+            memcpy(iccid,s0,res);
         }
     }
     _gs_release_slot(slot);
@@ -2054,20 +2134,62 @@ int _gs_dns(uint8_t*dns){
     uint8_t *s0=NULL;
     GSSlot *slot;
     slot = _gs_acquire_slot(GS_CMD_QIDNSCFG,NULL,64,GS_TIMEOUT,1);
-    _gs_send_at(GS_CMD_QIDNSCFG,"=?");
+    _gs_send_at(GS_CMD_QIDNSCFG,"=i",GS_PROFILE);
     _gs_wait_for_slot();
     if (!slot->err) {
-        if(_gs_parse_command_arguments(slot->resp,slot->eresp,"i\"s\"",&p0,&s0,&l0)!=2) {
+        *slot->eresp=0;
+        if(_gs_parse_command_arguments(slot->resp,slot->eresp,"iS",&p0,&s0,&l0)!=2) {
             res = 0;
-        } else {
-            res = l0;
-            if (s0) memcpy(dns,s0,MIN(15,l0));
+        } else if (s0) {
+            res = MIN(15,l0);
+            memcpy(dns,s0,res);
         }
     }
     _gs_release_slot(slot);
     return res;
-
 }
+
+int _gs_local_ip(uint8_t*ip){
+    int res=-1;
+    int l0,p0,p1,p2;
+    uint8_t *s0=NULL;
+    GSSlot *slot;
+    slot = _gs_acquire_slot(GS_CMD_QIACT,NULL,64,GS_TIMEOUT,1);
+    _gs_send_at(GS_CMD_QIACT,"?");
+    _gs_wait_for_slot();
+    if (!slot->err) {
+        *slot->eresp=0;
+        if(_gs_parse_command_arguments(slot->resp,slot->eresp,"iiiS",&p0,&p1,&p2,&s0,&l0)!=4) {
+            res = 0;
+        } else if (s0) {
+            res = MIN(15,l0);
+            memcpy(ip,s0,res);
+        }
+    }
+    _gs_release_slot(slot);
+    return res;
+}
+
+int _gs_cell_info(int *mcc, int *mnc){
+    int res=-1;
+    int p0,l0,l1,l2;
+    uint8_t *s0=NULL,*s1=NULL,*s2=NULL,*s3=NULL,*s4=NULL;
+    GSSlot *slot;
+    slot = _gs_acquire_slot(GS_CMD_QENG,NULL,256,5*GS_TIMEOUT,1);
+    _gs_send_at(GS_CMD_QENG,"=s","\"servingcell\"",13);
+    _gs_wait_for_slot();
+    if (!slot->err) {
+        if(_gs_parse_command_arguments(slot->resp,slot->eresp,
+            "SSSii",&s0,&l0,&s1,&l1,&s2,&l2,mcc,mnc)!=5) {
+            res = 0;
+        } else if (s0 && s1 && s2) {
+            res = 1;
+        }
+    }
+    _gs_release_slot(slot);
+    return res;
+}
+
 
 
 /////////// SMS HANDLING

@@ -14,7 +14,7 @@ int32_t ug96exc;
 /**
  * @brief strings for network types
  */
-uint8_t *_urats;
+uint8_t *_urats = "GSMUMTS";
 uint8_t _uratpos[] = {0,3};
 uint8_t _uratlen[] = {3,4};
 
@@ -61,8 +61,6 @@ C_NATIVE(_ug96_init){
     gs.status = status;
     gs.status_on = status_on;
     gs.kill = kill;
-    _urats = gc_malloc(3+10+11);
-    memcpy(_urats,"GSMUMTS",7);
     printf("After init\n");
     ACQUIRE_GIL();
 
@@ -87,9 +85,9 @@ C_NATIVE(_ug96_startup){
     if (!skip_poweron) {
         //setup pins
         printf("Setting pins\n");
-        vhalPinSetMode(gs.status,PINMODE_INPUT_PULLNONE);
+        vhalPinSetMode(gs.status,PINMODE_INPUT_PULLUP);
         vhalPinSetMode(gs.poweron,PINMODE_OUTPUT_PUSHPULL);
-        vhalPinSetMode(gs.reset,PINMODE_OUTPUT_PUSHPULL);
+        // vhalPinSetMode(gs.reset,PINMODE_OUTPUT_PUSHPULL);
         if (!_gs_poweron()) err = ERR_HARDWARE_INITIALIZATION_ERROR;
     }
 
@@ -101,6 +99,7 @@ C_NATIVE(_ug96_startup){
         printf("Starting modem thread with size %i\n",VM_DEFAULT_THREAD_SIZE);
         gs.thread = vosThCreate(VM_DEFAULT_THREAD_SIZE,VOS_PRIO_NORMAL,_gs_loop,NULL,NULL);
         vosThResume(gs.thread);
+        vosThSleep(TIME_U(1000,MILLIS)); // let modem thread have a chance to start
     }
     return err;
 }
@@ -330,36 +329,40 @@ C_NATIVE(_ug96_rssi){
  */
 C_NATIVE(_ug96_network_info){
     NATIVE_UNWARN();
-    int p0,l0,l1,l2,l3,l4;
-    uint8_t *s0,*s1,*s2,*s3,*s4,*st,*se;
+    int p0,l0,mcc,mnc;
     PString *urat;
-    PString *tstr=NULL;
     PTuple *tpl = ptuple_new(8,NULL);
+    uint8_t bsi[5];
 
     //RAT  : URAT
     //CELL : UCELLINFO
     RELEASE_GIL();
     _gs_check_network();
     _gs_is_attached();
+    
+    // get tech string (slice) from pre-allocated buffer
     if (gs.tech==0) p0=0;
     else if (gs.tech==2) p0=1;
     else p0=0;
     urat = pstring_new(_uratlen[p0],_urats+_uratpos[p0]);
     PTUPLE_SET_ITEM(tpl,0,urat);
 
-
-
-    PTUPLE_SET_ITEM(tpl,1,PSMALLINT_NEW(-1));
-    PTUPLE_SET_ITEM(tpl,2,PSMALLINT_NEW(-1));
+    if (_gs_cell_info(&mcc, &mnc) <= 0) {
+        mcc = -1;
+        mnc = -1;
+    }
+    PTUPLE_SET_ITEM(tpl,1,PSMALLINT_NEW(mcc));
+    PTUPLE_SET_ITEM(tpl,2,PSMALLINT_NEW(mnc));
     urat = pstring_new(0,NULL);
     PTUPLE_SET_ITEM(tpl,3,urat);
-    urat = pstring_new(4,gs.lac);
+
+    urat = pstring_new(strlen(gs.lac),gs.lac);
     PTUPLE_SET_ITEM(tpl,4,urat);
-    urat = pstring_new(4,gs.ci);
+    urat = pstring_new(strlen(gs.ci),gs.ci);
     PTUPLE_SET_ITEM(tpl,5,urat);
 
     //registered to network
-    PTUPLE_SET_ITEM(tpl,6,gs.registered ? PBOOL_TRUE():PBOOL_FALSE());
+    PTUPLE_SET_ITEM(tpl,6,(gs.registered==GS_REG_OK || gs.registered==GS_REG_ROAMING) ? PBOOL_TRUE():PBOOL_FALSE());
     //attached to APN
     PTUPLE_SET_ITEM(tpl,7,gs.attached ? PBOOL_TRUE():PBOOL_FALSE());
 
@@ -409,16 +412,20 @@ C_NATIVE(_ug96_link_info){
     PString *ips;
     PString *dns;
     uint32_t addrlen;
-    uint8_t dnss[16];
+    uint8_t addrbuf[16];
 
     RELEASE_GIL();
 
-    ips = pstring_new(0,NULL);
-    addrlen = _gs_dns(dnss);
-
-
+    addrlen = _gs_local_ip(addrbuf);
     if(addrlen>0){
-        dns = pstring_new(addrlen,dnss);
+        ips = pstring_new(addrlen,addrbuf);
+    } else {
+    ips = pstring_new(0,NULL);
+    }
+
+    addrlen = _gs_dns(addrbuf);
+    if(addrlen>0){
+        dns = pstring_new(addrlen,addrbuf);
     } else {
         dns = pstring_new(0,NULL);
     }

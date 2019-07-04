@@ -1,3 +1,18 @@
+#include "zerynth.h"
+#define SER_CHANNEL  0
+
+static void my_vbl_printf(uint8_t *fmt, ...) {
+    va_list vl;
+    va_start(vl, fmt);
+    vbl_printf((uint32_t)&vhalSerialWrite | 1, SER_CHANNEL, (uint8_t *)fmt, &vl);
+    va_end(vl);
+}
+#define print_buffer(buf,len) vhalSerialWrite(SER_CHANNEL, buf, len)
+#define printf(...)
+//#define printf(...) my_vbl_printf(__VA_ARGS__)
+//#define printf(...) vbl_printf_stdout(__VA_ARGS__)
+
+
 #define MAX_BUF 1024
 #define MAX_CMD 545
 #if !defined(UG96_MAX_SOCKS)
@@ -116,8 +131,8 @@ typedef struct _gsm_status{
     uint8_t dnsaddrlen;
     uint8_t dns_ready;
     uint8_t dns_count;
-    uint8_t lac[8];
-    uint8_t ci[8];
+    uint8_t lac[10];
+    uint8_t ci[10];
     uint8_t tech;
     uint8_t skipsms;
     uint8_t maxsms;
@@ -134,6 +149,7 @@ typedef struct _gsm_status{
 
 #define GS_ERR_OK      0
 #define GS_ERR_TIMEOUT 1
+#define GS_ERR_INVALID 2
 
 
 #define GS_REG_DENIED  2
@@ -162,53 +178,57 @@ typedef struct _gsm_status{
 // str param, then ok
 #define GS_RES_STR_OK        3
 
-#define GS_CMD_CCLK             0
-#define GS_CMD_CGATT            1
-#define GS_CMD_CGDCONT          2
-#define GS_CMD_CMEE             3
-#define GS_CMD_CMGD             4
-#define GS_CMD_CMGF             5
-#define GS_CMD_CMGL             6
-#define GS_CMD_CMGR             7
-#define GS_CMD_CMGS             8
-#define GS_CMD_CMTI             9
+enum {
+GS_CMD_CCLK,
+GS_CMD_CGATT,
+GS_CMD_CGDCONT,
+GS_CMD_CMEE,
+GS_CMD_CMGD,
+GS_CMD_CMGF,
+GS_CMD_CMGL,
+GS_CMD_CMGR,
+GS_CMD_CMGS,
+GS_CMD_CMTI,
 
 
-#define GS_CMD_COPS            10
-#define GS_CMD_CPMS            11
-#define GS_CMD_CREG            12
-#define GS_CMD_CSCA            13
-#define GS_CMD_CSQ             14
+GS_CMD_COPS,
+GS_CMD_CPMS,
+GS_CMD_CREG,
+GS_CMD_CSCA,
+GS_CMD_CSQ,
 
-#define GS_CMD_GSN             15
-#define GS_CMD_QCCID           16
-#define GS_CMD_QCFG            17
+GS_CMD_GSN,
+GS_CMD_QCCID,
+GS_CMD_QCFG,
 
-#define GS_CMD_QFDEL            18
-#define GS_CMD_QFUPL            19
+GS_CMD_QENG,
 
-#define GS_CMD_QGPS             20
-#define GS_CMD_QGPSCFG          21
-#define GS_CMD_QGPSEND          22
-#define GS_CMD_QGPSLOC          23
+GS_CMD_QFDEL,
+GS_CMD_QFUPL,
 
-#define GS_CMD_QIACT            24
-#define GS_CMD_QICLOSE          25
-#define GS_CMD_QICSGP           26
-#define GS_CMD_QIDEACT          27
-#define GS_CMD_QIDNSCFG         28
-#define GS_CMD_QIDNSGIP         29
-#define GS_CMD_QIOPEN           30
-#define GS_CMD_QIRD             31
-#define GS_CMD_QISEND           32
-#define GS_CMD_QIURC            33
+GS_CMD_QGPS,
+GS_CMD_QGPSCFG,
+GS_CMD_QGPSEND,
+GS_CMD_QGPSLOC,
 
-#define GS_CMD_QSSLCFG          34
-#define GS_CMD_QSSLCLOSE        35
-#define GS_CMD_QSSLOPEN         36
-#define GS_CMD_QSSLRECV         37
-#define GS_CMD_QSSLSEND         38
-#define GS_CMD_QSSLURC          39
+GS_CMD_QIACT,
+GS_CMD_QICLOSE,
+GS_CMD_QICSGP,
+GS_CMD_QIDEACT,
+GS_CMD_QIDNSCFG,
+GS_CMD_QIDNSGIP,
+GS_CMD_QIOPEN,
+GS_CMD_QIRD,
+GS_CMD_QISEND,
+GS_CMD_QIURC,
+
+GS_CMD_QSSLCFG,
+GS_CMD_QSSLCLOSE,
+GS_CMD_QSSLOPEN,
+GS_CMD_QSSLRECV,
+GS_CMD_QSSLSEND,
+GS_CMD_QSSLURC,
+};
 
 #define GS_GET_CMD(cmdid) (&gs_commands[cmdid])
 
@@ -238,6 +258,8 @@ static const GSCmd gs_commands[] = {
     DEF_CMD("+GSN",       GS_RES_STR_OK, GS_CMD_NORMAL , GS_CMD_GSN),
     DEF_CMD("+QCCID",     GS_RES_OK, GS_CMD_NORMAL , GS_CMD_QCCID),
     DEF_CMD("+QCFG",     GS_RES_OK, GS_CMD_NORMAL , GS_CMD_QCFG),
+
+    DEF_CMD("+QENG",      GS_RES_OK, GS_CMD_NORMAL , GS_CMD_QENG),
 
     DEF_CMD("+QFDEL",     GS_RES_OK, GS_CMD_NORMAL , GS_CMD_QFDEL),
     DEF_CMD("+QFUPL",     GS_RES_OK, GS_CMD_NORMAL , GS_CMD_QFUPL),
@@ -293,6 +315,8 @@ int _gs_is_attached(void);
 int _gs_imei(uint8_t  *imei);
 int _gs_iccid(uint8_t *iccid);
 int _gs_dns(uint8_t*dns);
+int _gs_local_ip(uint8_t *ip);
+int _gs_cell_info(int *mcc, int *mnc);
 
 int _gs_socket_connect(int id, NetAddress *addr);
 int _gs_socket_new(int proto, int secure);
