@@ -523,7 +523,7 @@ C_NATIVE(_ug96_socket_send) {
     RELEASE_GIL();
     wrt=0;
     while(wrt<len && err==ERR_OK){
-        tsnd = MIN(MAX_SOCK_BUF,(len-wrt));
+        tsnd = MIN(MAX_SOCK_TX_LEN,(len-wrt));
         tsnd = _gs_socket_send(sock,buf+wrt,tsnd);
         if (tsnd<0) {
             err=ERR_IOERROR_EXC;
@@ -558,7 +558,7 @@ C_NATIVE(_ug96_socket_sendto){
     RELEASE_GIL();
     wrt=0;
     while(wrt<len && err==ERR_OK){
-        tsnd = MIN(MAX_SOCK_BUF,(len-wrt));
+        tsnd = MIN(MAX_SOCK_TX_LEN,(len-wrt));
         tsnd = _gs_socket_sendto(sock,buf+wrt,tsnd,&addr);
         if (tsnd<0) {
             err=ERR_IOERROR_EXC;
@@ -599,12 +599,22 @@ C_NATIVE(_ug96_socket_recv_into){
     RELEASE_GIL();
 
     rb=0;
-    while(rb<len && err==ERR_OK){
-        printf("Reading %i\n",len-rb);
+    while(rb<len){
+        // printf("Reading %i\n",len-rb);
         trec = _gs_socket_recv(sock,buf+rb,len-rb);
-        printf("Read %i\n",trec);
+        // printf("Read %i\n",trec);
         if(trec<0) {
-            err=ERR_IOERROR_EXC;
+            if (trec == -3) {
+                // connection closed by server, do not rise exception
+                break;
+            }
+            if (trec == -2) {
+                err=ERR_TIMEOUT_EXC;
+            }
+            else {
+                err=ERR_IOERROR_EXC;
+            }
+            break;
         } else {
             rb+=trec;
         }
@@ -645,17 +655,20 @@ C_NATIVE(_ug96_socket_recvfrom_into){
     len = (sz < len) ? sz : len;
     RELEASE_GIL();
     rb=0;
-    while(rb<len && err==ERR_OK){
+    while(rb==0){
         trec = _gs_socket_recvfrom(sock,buf+rb,len-rb,addr,&addrlen,&port);
-        if (trec==0 && rb==0){
-            //no data yet
-            continue;
-        } else if(trec<0) {
-            err=ERR_IOERROR_EXC;
+        if(trec<0) {
+            if (trec == -2) {
+                err=ERR_TIMEOUT_EXC;
+            }
+            else {
+                err=ERR_IOERROR_EXC;
+            }
+            // if trec == -3 closed by server, do not rise exception
+            break;
         } else {
             //got udp packet
             rb+=trec;
-            break;
         }
     }
     ACQUIRE_GIL();

@@ -196,10 +196,31 @@ int _gs_wait_for_ok(int timeout){
 }
 
 /**
+ * @brief Empty the serial receive buffer
+ *
+ * Use to discard old received data not pertaining to next command!
+ */
+int _gs_empty_rx(){
+    int bytes = vhalSerialAvailable(gs.serial);
+    while (bytes > 0) {
+        bytes = MIN(bytes, MAX_BUF-1);
+        vhalSerialRead(gs.serial,gs.buffer,bytes);
+        //terminate for debugging!
+        gs.buffer[bytes+1]=0;
+        printf("re: %s\n",gs.buffer);
+        // check if anything else has been received
+        vosThSleep(TIME_U(10,MILLIS));
+        bytes = vhalSerialAvailable(gs.serial);
+    }
+    gs.buffer[0] = 0;
+    gs.bytes = 0;
+}
+
+/**
  * @brief Read a line from the module
  *
  * Lines are saved into gs.buffer and null terminated. The number of bytes read 
- * is saved in gs.buffer and returned. The timeout is implemented with a 50 milliseconds
+ * is saved in gs.bytes and returned. The timeout is implemented with a 50 milliseconds
  * polling strategy. TODO: change when the serial driver will support timeouts
  *
  * @param[in]   timeout     the number of milliseconds to wait for a line
@@ -248,10 +269,11 @@ int _gs_readline(int timeout){
 int _gs_read(int bytes){
     memset(gs.buffer,0,16);
     if (bytes<=0) bytes = vhalSerialAvailable(gs.serial);
-    vhalSerialRead(gs.serial,gs.buffer,bytes);
-    gs.bytes = bytes;
-    gs.buffer[gs.bytes+1]=0; // WATCH THIS!!
-    // printf("rn: %s||\n",gs.buffer);
+    gs.bytes = MIN(bytes, MAX_BUF-1);
+    vhalSerialRead(gs.serial,gs.buffer,gs.bytes);
+    //terminate for debugging!
+    gs.buffer[gs.bytes+1]=0;
+    //printf("rn: %s\n",gs.buffer);
     return gs.bytes;
 }
 
@@ -529,16 +551,21 @@ void _gs_send_at(int cmd_id,const char *fmt,...){
 
 int _gs_wait_for_pin_ready() {
     int i;
-    for(i=10;i>0;--i) {
+    for(i=3;i>0;--i) {
+        _gs_empty_rx();
         vhalSerialWrite(gs.serial,"AT+CPIN?\r\n",10);
-        while(_gs_readline(1000)>=0){
-            if(_gs_findstr(gs.buffer,gs.buffer+gs.bytes,"READY")){
-                if(!_gs_wait_for_ok(500)) continue;
-                i = -1;
-                break;
+        uint32_t tstart = vosMillis();
+        do {
+            if(_gs_readline(1000)>=0){
+                if(_gs_findstr(gs.buffer,gs.buffer+gs.bytes,"+CPIN: READY")){
+                    if(!_gs_wait_for_ok(500)) continue;
+                    i = -1; // success, exit!
+                    break;
+                }
             }
-        }
+        } while ((vosMillis()-tstart)<5000); // max reply time 5s
     }
+    _gs_empty_rx();
     return (i < 0);
 }
 
@@ -569,12 +596,20 @@ int _gs_get_activity_status() {
 int _gs_config0(){
     //clean serial
     int i;
-    //autobaud
-    for(i=0;i<200;i++) {
+    //autobaud (max 10 seconds)
+    for(i=0;i<50;i++) {
         vhalSerialWrite(gs.serial,"ATE1\r\n",6);
         printf(".\n");
-        if(_gs_wait_for_ok(200)) break;
+        if(_gs_readline(200)>=0){
+            if(_gs_findstr(gs.buffer,gs.buffer+gs.bytes,"ATE1")){
+                if (_gs_wait_for_ok(200))
+                    break;
+            }
+        }
     }
+    // discard any rubbish
+    vosThSleep(TIME_U(500,MILLIS));
+    _gs_empty_rx();
     
     //disable echo
     vhalSerialWrite(gs.serial,"ATE0\r\n",6);
@@ -603,7 +638,6 @@ int _gs_config0(){
         if (pas < 0) return 0;
         if (pas==0|pas==3|pas==4) break;
         vosThSleep(TIME_U(1000,MILLIS));
-        //vhalKickWatchdog();
     }
     if (i == 0) return 0;
     //timezone update
@@ -809,7 +843,7 @@ int _gs_wait_for_slot_mode(uint8_t *text, int32_t textlen,uint8_t* addtxt, int a
 
     if(gs.mode!=GS_MODE_PROMPT) return -1;
     printf("Slot wait mode\n-->");
-    print_buffer(text,textlen);
+    // print_buffer(text,textlen);
     printf("\n");
 
     while(textlen>0){
@@ -949,6 +983,11 @@ void _gs_slot_params(GSCmd *cmd){
     //copy params to slot
     if (!gs.slot->resp) return;
     if(cmd->response_type == GS_RES_STR || cmd->response_type== GS_RES_STR_OK) {
+        if (memcmp(gs.buffer, "+QIND", 5) == 0){
+            // skip invalid param
+            printf("unknown URC: %s\n",gs.buffer);
+            return;
+        }
         int csize = (gs.slot->max_size<gs.bytes) ? gs.slot->max_size:gs.bytes;
         memcpy(gs.slot->resp,gs.buffer,csize);
         gs.slot->eresp = gs.slot->resp+csize;
@@ -1351,7 +1390,7 @@ int _gs_socket_opened(int id, int success){
 }
 
 int _gs_socket_bind(int id, NetAddress *addr){
-    int res = -1;
+    int res = 0;
     int timeout = 160000; //150s timeout for URC
     GSocket *sock;
     GSSlot *slot;
@@ -1368,12 +1407,13 @@ int _gs_socket_bind(int id, NetAddress *addr){
         res=-1;
     }
     _gs_release_slot(slot);
-    if (res) {
-        //release socket
-        sock->acquired = 0;
-    }
 
     vosSemSignal(sock->lock);
+    if (res == -1) {
+        return res;
+    }
+
+    res = -1;
 
     while(timeout>0){
         vosThSleep(TIME_U(100,MILLIS));
@@ -1393,7 +1433,9 @@ int _gs_socket_bind(int id, NetAddress *addr){
     if(res) {
         //oops, timeout or error
         vosSemWait(sock->lock);
-        sock->acquired=0;
+        // close to allow retrying a new connect on the same sock
+        _gs_do_close(id);
+        sock->bound = 0;
         vosSemSignal(sock->lock);
     } else {
         sock->bound = 1;
@@ -1405,7 +1447,7 @@ int _gs_socket_bind(int id, NetAddress *addr){
 int _gs_socket_connect(int id, NetAddress *addr){
     uint8_t saddr[16];
     uint32_t saddrlen;
-    int res = -1;
+    int res = 0;
     int timeout = 160000; //150s timeout for URC
     saddrlen = _gs_socket_addr(addr,saddr);
     GSocket *sock;
@@ -1436,12 +1478,13 @@ int _gs_socket_connect(int id, NetAddress *addr){
         res=-1;
     }
     _gs_release_slot(slot);
-    if (res) {
-        //release socket
-        sock->acquired = 0;
-    }
 
     vosSemSignal(sock->lock);
+    if (res == -1) {
+        return res;
+    }
+
+    res = -1;
 
     while(timeout>0){
         vosThSleep(TIME_U(100,MILLIS));
@@ -1458,10 +1501,11 @@ int _gs_socket_connect(int id, NetAddress *addr){
         if(!res||res==-2) break;
     }
 
-    if(res) {
-        //oops, timeout or error
+    if (res) {
         vosSemWait(sock->lock);
-        sock->acquired=0;
+        // if connection failed, close to allow retrying a new connect on the same sock
+        _gs_do_close(id);
+        sock->connected = 0;
         vosSemSignal(sock->lock);
     }
     return res;
@@ -1487,18 +1531,16 @@ GSocket *_gs_socket_get(int id){
 }
 
 /**
- * @brief 
+ * @brief Send command to close the socket (use internally)
  *
- * @param id
+ * @param id index of the socket
  */
-int _gs_socket_close(int id){
+int _gs_do_close(int id) {
     GSocket *sock;
     GSSlot *slot;
     int res = 0;
     sock = &gs_sockets[id];
 
-
-    vosSemWait(sock->lock);
     if (sock->secure) {
         slot = _gs_acquire_slot(GS_CMD_QSSLCLOSE,NULL,0,GS_TIMEOUT*10,0);
         _gs_send_at(GS_CMD_QSSLCLOSE,"=i,10",id);
@@ -1510,11 +1552,36 @@ int _gs_socket_close(int id){
     if (slot->err) {
         res=-1;
     }
-    _gs_release_slot(slot);
-    //regardless of the error, close
+    _gs_release_slot(slot); 
 
-    //unlock sockets waiting on rx
+    if (res == 0) {
+        sock->connected = 0;
+        sock->bound = 0;
+    }
+
+    return res;
+}
+
+/**
+ * @brief Close socket and release resources
+ *
+ * Even after a socket connection has been closed remotely, call this function
+ * to free the allocated socket resource.
+ *
+ * @param id index of the socket
+ */
+int _gs_socket_close(int id){
+    GSocket *sock;
+    // GSSlot *slot;
+    int res = 0;
+    sock = &gs_sockets[id];
+
+
+    vosSemWait(sock->lock);
+    res = _gs_do_close(id);
+    //regardless of the error (already closed), release this socket index
     sock->acquired = 0;
+    //unlock sockets waiting on rx
     vosSemSignal(sock->rx);
     vosSemSignal(sock->lock);
     return res;
@@ -1602,7 +1669,6 @@ int _gs_socket_sendto(int id, uint8_t* buf, int len, NetAddress *addr) {
 }
 
 int _gs_socket_recvfrom(int id, uint8_t* buf, int len, uint8_t* addr, int*addrlen, int*port){
-    int trec=0;
     int res = len;
     int rd;
     int nargs;
@@ -1614,17 +1680,17 @@ int _gs_socket_recvfrom(int id, uint8_t* buf, int len, uint8_t* addr, int*addrle
 
     sock = &gs_sockets[id];
     vosSemWait(sock->lock);
+
     if (sock->to_be_closed) {
-        res=-1;
+        res=-3;
     } else {
-        trec = MIN(MAX_SOCK_BUF,len);
+        //read from slot
         slot = _gs_acquire_slot(GS_CMD_QIRD,NULL,64,GS_TIMEOUT*10,1);
         _gs_send_at(GS_CMD_QIRD,"=i",id);
         if(!_gs_wait_for_buffer_mode()){
             //oops, timeout
-            res = -1;
+            res = -2;
         }
-        
         nargs = _gs_parse_command_arguments(slot->resp,slot->eresp,"isi",&rd,&remote_ip,&remote_len,&remote_port);
         printf("READ NARGS %i %i %i %i\n",nargs,rd,remote_len,remote_port);
         if(nargs==3){
@@ -1632,16 +1698,16 @@ int _gs_socket_recvfrom(int id, uint8_t* buf, int len, uint8_t* addr, int*addrle
             memcpy(addr,remote_ip+1,MIN(15,(remote_len-2)));
             *addrlen = remote_len-2;
             *port = remote_port;
+            //if buf not large enough, exceeding data is discarded
             _gs_exit_from_buffer_mode_r(buf,len,rd,NULL);
         } else {
             if (nargs>1 && rd==0 && remote_len==0) {
                 //no data
                 res=0;
-                _gs_exit_from_buffer_mode_r(NULL,0,0,NULL);
             } else {
                 res = -1;
-                _gs_exit_from_buffer_mode_r(NULL,0,0,NULL);
             }
+            _gs_exit_from_buffer_mode_r(NULL,0,0,NULL);
         }
         _gs_wait_for_slot();
         if (slot->err) {
@@ -1649,9 +1715,10 @@ int _gs_socket_recvfrom(int id, uint8_t* buf, int len, uint8_t* addr, int*addrle
         }
         _gs_release_slot(slot);
     }
+
     vosSemSignal(sock->lock);
     if (res==0) {
-        //empty buffer, wait with timeout
+        //no data arrived, wait with timeout
         printf("Waiting for rx\n");
         vosSemWaitTimeout(sock->rx,TIME_U(5000,MILLIS));
     }
@@ -1691,20 +1758,20 @@ int _gs_socket_recv(int id, uint8_t* buf, int len){
 
     sock = &gs_sockets[id];
     vosSemWait(sock->lock);
-    if (sock->to_be_closed) {
-        res=-1;
+    //read first the leftover from socket rx buffer
+    rd = _gs_sock_copy(id, buf, len);
+    buf+=rd;
+    len-=rd;
+    if(rd>0) {
+        //skip command
+        printf("Skip cmd\n");
+        res=rd;
     } else {
-        //read from buffer
-        rd = _gs_sock_copy(id, buf, len);
-        buf+=rd;
-        len-=rd;
-        if(rd>0) {
-            //skip command
-            printf("Skip cmd\n");
-            res=rd;
-        }else {
+        if (sock->to_be_closed) {
+            res=-3;
+        } else {
             //read from slot
-            trec = MIN(MAX_SOCK_BUF,len);
+            trec = MAX_SOCK_RX_LEN;
             if (sock->secure) {
                 slot = _gs_acquire_slot(GS_CMD_QSSLRECV,NULL,64,GS_TIMEOUT*10,1);
                 _gs_send_at(GS_CMD_QSSLRECV,"=i,i",id,trec);
@@ -1714,11 +1781,12 @@ int _gs_socket_recv(int id, uint8_t* buf, int len){
             }
             if(!_gs_wait_for_buffer_mode()){
                 //oops, timeout
-                res = -1;
+                res = -2;
             }
             if (_gs_parse_command_arguments(slot->resp,slot->eresp,"i",&rd)==1){
-                res = MIN(trec,rd);
-                _gs_exit_from_buffer_mode_r(buf,trec,rd,sock);
+                //get len bytes and leave the rest in the buffer
+                res = MIN(len,rd);
+                _gs_exit_from_buffer_mode_r(buf,res,rd,sock);
             } else {
                 res = -1;
                 _gs_exit_from_buffer_mode_r(NULL,0,0,NULL);
@@ -1731,8 +1799,8 @@ int _gs_socket_recv(int id, uint8_t* buf, int len){
         }
     }
     vosSemSignal(sock->lock);
-    if (res==0) {
-        //empty buffer, wait with timeout
+    if (res>=0 && len>res) {
+        //need more data, wait with timeout
         printf("Waiting for rx\n");
         vosSemWaitTimeout(sock->rx,TIME_U(5000,MILLIS));
     }
@@ -1748,36 +1816,35 @@ int _gs_socket_available(int id){
 
     sock = &gs_sockets[id];
     vosSemWait(sock->lock);
-    if (sock->to_be_closed) {
-        res=-1;
-    } else {
     //read from buffer
-    if (sock->len>0) res=sock->len;
-    else {
+    if (sock->len>0)
+        res=sock->len;
+    else if (sock->to_be_closed) {
+        res=-3;
+    } else {
         if (sock->secure) {
-                slot = _gs_acquire_slot(GS_CMD_QSSLRECV,NULL,64,GS_TIMEOUT*10,1);
-                _gs_send_at(GS_CMD_QSSLRECV,"=i,0",id);
-            } else {
-                slot = _gs_acquire_slot(GS_CMD_QIRD,NULL,64,GS_TIMEOUT*10,1);
-                _gs_send_at(GS_CMD_QIRD,"=i,0",id);
-            }
-            if(!_gs_wait_for_buffer_mode()){
-                //oops, timeout
-                res = -1;
-            } else {
-                if (_gs_parse_command_arguments(slot->resp,slot->eresp,"iii",&total,&rd,&toberd)==3){
-                    res = toberd;
-                } else {
-                    res = -1;
-                }
-                _gs_exit_from_buffer_mode_r(NULL,0,0,NULL);
-            }
-            _gs_wait_for_slot();
-            if (slot->err) {
-                res= -1;
-            }
-            _gs_release_slot(slot);
+            slot = _gs_acquire_slot(GS_CMD_QSSLRECV,NULL,64,GS_TIMEOUT*10,1);
+            _gs_send_at(GS_CMD_QSSLRECV,"=i,0",id);
+        } else {
+            slot = _gs_acquire_slot(GS_CMD_QIRD,NULL,64,GS_TIMEOUT*10,1);
+            _gs_send_at(GS_CMD_QIRD,"=i,0",id);
         }
+        if(!_gs_wait_for_buffer_mode()){
+            //oops, timeout
+            res = -2;
+        } else {
+            if (_gs_parse_command_arguments(slot->resp,slot->eresp,"iii",&total,&rd,&toberd)==3){
+                res = toberd;
+            } else {
+                res = -1;
+            }
+            _gs_exit_from_buffer_mode_r(NULL,0,0,NULL);
+        }
+        _gs_wait_for_slot();
+        if (slot->err) {
+            res= -1;
+        }
+        _gs_release_slot(slot);
     }
     vosSemSignal(sock->lock);
     return res;

@@ -1,5 +1,5 @@
 #include "zerynth.h"
-#define SER_CHANNEL  0
+#define SER_CHANNEL  2
 
 static void my_vbl_printf(uint8_t *fmt, ...) {
     va_list vl;
@@ -20,8 +20,9 @@ static void my_vbl_printf(uint8_t *fmt, ...) {
 #else
 #define MAX_SOCKS UG96_MAX_SOCKS
 #endif
-#define MAX_SOCK_BUF 128
-#define MAX_SOCK_RX_BUF 1500
+#define MAX_SOCK_TX_LEN 1460	// max out packet len supported by modem
+#define MAX_SOCK_RX_BUF 1500	// max len of any packet read from modem
+#define MAX_SOCK_RX_LEN 256		// request len for buffered reads (<=RX_BUF)
 #define MAX_OPS   6
 #define MAX_ERR_LEN 32
 #define GS_TIMEOUT 1000
@@ -126,7 +127,7 @@ typedef struct _gsm_status{
     VSemaphore dnsmode;
     VThread thread;
     uint8_t errmsg[MAX_ERR_LEN];
-    uint8_t buffer[MAX_CMD];
+    uint8_t buffer[MAX_BUF];
     uint8_t dnsaddr[16];
     uint8_t dnsaddrlen;
     uint8_t dns_ready;
