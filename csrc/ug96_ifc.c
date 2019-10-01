@@ -1,7 +1,8 @@
-//#define ZERYNTH_PRINTF
+// #define ZERYNTH_PRINTF
 #include "zerynth.h"
 #include "ug96_ifc.h"
 
+// #define printf(...) vbl_printf_stdout(__VA_ARGS__)
 
 //a reference to a Python exception to be returned on error (g350Exception)
 int32_t ug96exc;
@@ -17,7 +18,7 @@ int32_t ug96exc;
 uint8_t *_urats = "GSMUMTS";
 uint8_t _uratpos[] = {0,3};
 uint8_t _uratlen[] = {3,4};
-
+SocketAPIPointers ug96_api;
 /**
  * @brief _g350_init calls _gs_init, _gs_poweron and _gs_config0
  *
@@ -63,6 +64,30 @@ C_NATIVE(_ug96_init){
     gs.kill = kill;
     printf("After init\n");
     ACQUIRE_GIL();
+    ug96_api.socket = ug96_gzsock_socket;
+    ug96_api.connect = ug96_gzsock_connect;
+    ug96_api.setsockopt = ug96_gzsock_setsockopt;
+    ug96_api.getsockopt = ug96_gzsock_getsockopt;
+    ug96_api.send = ug96_gzsock_send;
+    ug96_api.sendto = ug96_gzsock_sendto;
+    ug96_api.write = ug96_gzsock_write;
+    ug96_api.recv = ug96_gzsock_recv;
+    ug96_api.recvfrom = ug96_gzsock_recvfrom;
+    ug96_api.read = ug96_gzsock_read;
+    ug96_api.close = ug96_gzsock_close;
+    ug96_api.shutdown = ug96_gzsock_shutdown;
+    ug96_api.bind = ug96_gzsock_bind;
+    ug96_api.accept = NULL;
+    ug96_api.listen = NULL;
+    ug96_api.select = ug96_gzsock_select;
+    ug96_api.fcntl = ug96_gzsock_fcntl;
+    ug96_api.ioctl = NULL;
+    ug96_api.getaddrinfo = ug96_gzsock_getaddrinfo;
+    ug96_api.freeaddrinfo = ug96_gzsock_freeaddrinfo;
+    ug96_api.inet_addr = NULL;
+    ug96_api.inet_ntoa = NULL;
+
+    gzsock_init(&ug96_api);
 
     return err;
 }
@@ -446,7 +471,6 @@ C_NATIVE(_ug96_link_info){
 
 C_NATIVE(_ug96_socket_create){
     NATIVE_UNWARN();
-    int err = ERR_OK;
     int32_t family;
     int32_t type;
     int32_t proto;
@@ -455,56 +479,59 @@ C_NATIVE(_ug96_socket_create){
         return ERR_TYPE_EXC;
     if (family != DRV_AF_INET)
         return ERR_UNSUPPORTED_EXC;
-    proto = (type == DRV_SOCK_DGRAM) ? 17 : 6;
 
     RELEASE_GIL();
-    err = _gs_socket_new(proto,0);
-    if(err<0) {
-        err = ERR_IOERROR_EXC;
-    } else {
-        *res = PSMALLINT_NEW(err);
-        err = ERR_OK;
-    }
+    int32_t sock_id = gzsock_socket(
+          family,
+          type + 1,
+          proto,
+          NULL);
     ACQUIRE_GIL();
+    if(sock_id<0) {
+        return ERR_IOERROR_EXC;
+    } 
+    *res = PSMALLINT_NEW(sock_id);
 
-    return err;
+    return ERR_OK;
 }
 
 C_NATIVE(_ug96_socket_connect) {
     C_NATIVE_UNWARN();
-    int32_t sock,err=ERR_OK;
-    GSocket *ssock;
-    GSSlot *slot;
-    NetAddress addr;
+    int32_t sock,ret;
+    NetAddress netaddr;
+    struct sockaddr_in addr;
 
-    if (parse_py_args("in", nargs, args, &sock, &addr) != 2)
+    if (parse_py_args("in", nargs, args, &sock, &netaddr) != 2)
         return ERR_TYPE_EXC;
 
+    addr.sin_family = AF_INET;
+    addr.sin_port = netaddr.port;
+    addr.sin_addr.s_addr = netaddr.ip;
+
     *res = MAKE_NONE();
+
     RELEASE_GIL();
-    sock = _gs_socket_connect(sock,&addr);
-    if(sock) {
-        err = ERR_IOERROR_EXC;
-    }
+    ret = gzsock_connect(sock, (struct sockaddr *) &addr, sizeof(addr));
     ACQUIRE_GIL();
-    return err;
+
+    if (ret < 0) {
+        return ERR_CONNECTION_REF_EXC;
+    }
+
+    return ERR_OK;
 }
 
 C_NATIVE(_ug96_socket_close) {
     C_NATIVE_UNWARN();
     int32_t sock;
-    GSocket *ssock;
-    GSSlot *slot;
-    int err = ERR_OK;
-    int rr;
+    int ret;
     if (parse_py_args("i", nargs, args, &sock) != 1)
         return ERR_TYPE_EXC;
     RELEASE_GIL();
-    sock = _gs_socket_close(sock);
-    //ignore result
+    ret = gzsock_close(sock);//_gs_socket_close(sock);
     ACQUIRE_GIL();
-    *res = PSMALLINT_NEW(sock);
-    return err;
+    *res = PSMALLINT_NEW(ret);
+    return ERR_OK;
 }
 
 C_NATIVE(_ug96_socket_send) {
@@ -513,27 +540,19 @@ C_NATIVE(_ug96_socket_send) {
     int32_t len;
     int32_t flags;
     int32_t sock;
-    int32_t wrt;
-    int32_t tsnd;
-    int err = ERR_OK;
+    int ret;
     if (parse_py_args("isi", nargs, args,
                 &sock,
                 &buf, &len,
                 &flags) != 3) return ERR_TYPE_EXC;
+
     RELEASE_GIL();
-    wrt=0;
-    while(wrt<len && err==ERR_OK){
-        tsnd = MIN(MAX_SOCK_TX_LEN,(len-wrt));
-        tsnd = _gs_socket_send(sock,buf+wrt,tsnd);
-        if (tsnd<0) {
-            err=ERR_IOERROR_EXC;
-            break;
-        }
-        wrt+=tsnd;
-    }
+    ret = gzsock_send(sock, buf, len, flags);
     ACQUIRE_GIL();
-    *res = PSMALLINT_NEW(wrt);
-    return err;
+
+    if (ret<0) return ERR_IOERROR_EXC;
+    *res = PSMALLINT_NEW((uint32_t)ret);
+    return ERR_OK;
 }
 
 C_NATIVE(_ug96_socket_sendto){
@@ -544,32 +563,29 @@ C_NATIVE(_ug96_socket_sendto){
     int32_t sock;
     int32_t wrt=0;
     int32_t tsnd;
-    int32_t err=ERR_OK;
-    NetAddress addr;
+    int32_t ret;
+    NetAddress netaddr;
 
     if (parse_py_args("isni", nargs, args,
             &sock,
             &buf, &len,
-            &addr,
+            &netaddr,
             &flags)
         != 4)
         return ERR_TYPE_EXC;
 
-    RELEASE_GIL();
-    wrt=0;
-    while(wrt<len && err==ERR_OK){
-        tsnd = MIN(MAX_SOCK_TX_LEN,(len-wrt));
-        tsnd = _gs_socket_sendto(sock,buf+wrt,tsnd,&addr);
-        if (tsnd<0) {
-            err=ERR_IOERROR_EXC;
-            break;
-        }
-        wrt+=tsnd;
-    }
-    ACQUIRE_GIL();
+    struct sockaddr_in addr;
 
-    *res = PSMALLINT_NEW(wrt);
-    return err;
+    addr.sin_family = AF_INET;
+    addr.sin_port = netaddr.port;
+    addr.sin_addr.s_addr = netaddr.ip;
+
+    RELEASE_GIL();
+    ret = gzsock_sendto(sock, buf, len, flags, (struct sockaddr *) &addr, sizeof(addr));
+    ACQUIRE_GIL();
+    if (ret<0) return ERR_IOERROR_EXC;
+    *res = PSMALLINT_NEW((uint32_t)ret);
+    return ERR_OK;
 }
 
 C_NATIVE(_ug96_socket_recv_into){
@@ -580,10 +596,8 @@ C_NATIVE(_ug96_socket_recv_into){
     int32_t flags;
     int32_t ofs;
     int32_t sock;
-    int rb;
-    int trec;
-    int err = ERR_OK;
-    uint8_t *hex;
+    int ret;
+
     if (parse_py_args("isiiI", nargs, args,
             &sock,
             &buf, &len,
@@ -597,31 +611,25 @@ C_NATIVE(_ug96_socket_recv_into){
     len -= ofs;
     len = (sz < len) ? sz : len;
     RELEASE_GIL();
-
-    rb=0;
-    while(rb<len){
-        // printf("Reading %i\n",len-rb);
-        trec = _gs_socket_recv(sock,buf+rb,len-rb);
-        // printf("Read %i\n",trec);
-        if(trec<0) {
-            if (trec == -3) {
-                // connection closed by server, do not rise exception
-                break;
-            }
-            if (trec == -2) {
-                err=ERR_TIMEOUT_EXC;
-            }
-            else {
-                err=ERR_IOERROR_EXC;
-            }
-            break;
-        } else {
-            rb+=trec;
+    ret = gzsock_recv(sock, buf, len, flags);
+    ACQUIRE_GIL();
+    printf("requested %i from %i, returned %i\n",len,sock,ret);
+    if (ret<0) {
+        if (ret == ERR_TIMEOUT) {
+            return ERR_TIMEOUT_EXC;
+        } 
+#if defined ZERYNTH_SSL || defined NATIVE_MBEDTLS
+        else if (ret == MBEDTLS_ERR_SSL_TIMEOUT){
+            return ERR_TIMEOUT_EXC;
+        }
+#endif
+        else {
+            return ERR_IOERROR_EXC;
         }
     }
-    ACQUIRE_GIL();
-    *res = PSMALLINT_NEW(rb);
-    return err;
+    
+    *res = PSMALLINT_NEW((uint32_t)ret);
+    return ERR_OK;
 }
 
 C_NATIVE(_ug96_socket_recvfrom_into){
@@ -632,14 +640,12 @@ C_NATIVE(_ug96_socket_recvfrom_into){
     int32_t flags;
     int32_t ofs;
     int32_t sock;
-    int rb;
-    int trec;
-    int err = ERR_OK;
-    uint8_t addr[16];
-    uint32_t addrlen;
+    int ret;
+
     PString *oaddr = NULL;
     int32_t port;
-    int gotip=0;
+
+    struct sockaddr_in addr;
 
     if (parse_py_args("isiiI", nargs, args,
             &sock,
@@ -654,35 +660,22 @@ C_NATIVE(_ug96_socket_recvfrom_into){
     len -= ofs;
     len = (sz < len) ? sz : len;
     RELEASE_GIL();
-    rb=0;
-    while(rb==0){
-        trec = _gs_socket_recvfrom(sock,buf+rb,len-rb,addr,&addrlen,&port);
-        if(trec<0) {
-            if (trec == -2) {
-                err=ERR_TIMEOUT_EXC;
-            }
-            else {
-                err=ERR_IOERROR_EXC;
-            }
-            // if trec == -3 closed by server, do not rise exception
-            break;
-        } else {
-            //got udp packet
-            rb+=trec;
-        }
-    }
+    ret = gzsock_recvfrom(sock, buf, len, flags,  (struct sockaddr *) &addr, sizeof(addr));
     ACQUIRE_GIL();
-    if(err==ERR_OK){
+    if(ret>=0){
+        uint8_t remote_ip[16];
+        int saddrlen;
+        saddrlen = zs_addr_to_string(&addr,remote_ip);
         PTuple* tpl = (PTuple*)psequence_new(PTUPLE, 2);
-        PTUPLE_SET_ITEM(tpl, 0, PSMALLINT_NEW(rb));
-        oaddr = pstring_new(addrlen,addr);
+        PTUPLE_SET_ITEM(tpl, 0, PSMALLINT_NEW(ret));
+        oaddr = pstring_new(saddrlen,remote_ip);
         PTuple* ipo = ptuple_new(2,NULL);
         PTUPLE_SET_ITEM(ipo,0,oaddr);
-        PTUPLE_SET_ITEM(ipo,1,PSMALLINT_NEW(port));
+        PTUPLE_SET_ITEM(ipo,1,PSMALLINT_NEW(OAL_GET_NETPORT(addr.sin_port)));
         PTUPLE_SET_ITEM(tpl, 1, ipo);
         *res = tpl;
     }
-    return err;
+    return ERR_OK;
 }
 
 
@@ -690,96 +683,106 @@ C_NATIVE(_ug96_socket_recvfrom_into){
 C_NATIVE(_ug96_socket_bind){
     C_NATIVE_UNWARN();
     int32_t sock;
-    NetAddress addr;
-    GSocket *ssock;
-    GSSlot *slot;
-    int err = ERR_OK;
-    if (parse_py_args("in", nargs, args, &sock, &addr) != 2)
+    NetAddress netaddr;
+    struct sockaddr_in addr;
+    int ret;
+    if (parse_py_args("in", nargs, args, &sock, &netaddr) != 2)
         return ERR_TYPE_EXC;
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = netaddr.port;
+    addr.sin_addr.s_addr = netaddr.ip;
     RELEASE_GIL();
-    if(_gs_socket_bind(sock,&addr)){
-        err = ERR_IOERROR_EXC;
-    }
+    ret = gzsock_bind(sock,&addr,sizeof(addr));
     ACQUIRE_GIL();
+    if(ret<0) {
+        return ERR_IOERROR_EXC;
+    }
     *res = MAKE_NONE();
-    return err;
+    return ERR_OK;
 }
 
 
 C_NATIVE(_ug96_socket_select){
     C_NATIVE_UNWARN();
     int32_t timeout;
-    int32_t tmp, i, j, sock = -1,r;
-    uint32_t tstart;
-    PObject *tobj;
+    int32_t tmp, i, j, sock = -1,ret;
 
     if (nargs < 4)
-        return ERR_TYPE_EXC;
+    return ERR_TYPE_EXC;
 
-    PObject* rlist = args[0];
-    PObject* wlist = args[1];
-    PObject* xlist = args[2];
-    PObject* tm = args[3];
-    int rls = PSEQUENCE_ELEMENTS(rlist);
+    fd_set rfd;
+    fd_set wfd;
+    fd_set xfd;
+    struct timeval tms;
+    struct timeval *ptm;
+    PObject *rlist = args[0];
+    PObject *wlist = args[1];
+    PObject *xlist = args[2];
+    fd_set *fdsets[3] = {&rfd, &wfd, &xfd};
+    PObject *slist[3] = {rlist, wlist, xlist};
+    PObject *tm = args[3];
+
 
     if (tm == MAKE_NONE()) {
-        timeout = -1;
+        ptm = NULL;
     } else if (IS_PSMALLINT(tm)) {
         timeout = PSMALLINT_VALUE(tm);
-    } else {
-        return ERR_TYPE_EXC;
+        if (timeout < 0)
+            return ERR_TYPE_EXC;
+        tms.tv_sec = timeout / 1000;
+        tms.tv_usec = (timeout % 1000) * 1000;
+        ptm = &tms;
+    } else return ERR_TYPE_EXC;
+
+    for (j = 0; j < 3; j++) {
+        tmp = PTYPE(slist[j]);
+        if (!IS_OBJ_PSEQUENCE_TYPE(tmp))
+            return ERR_TYPE_EXC;
+        FD_ZERO (fdsets[j]);
+        for (i = 0; i < PSEQUENCE_ELEMENTS(slist[j]); i++) {
+            PObject *fd = PSEQUENCE_OBJECTS(slist[j])[i];
+            if (IS_PSMALLINT(fd)) {
+                //printf("%i -> %i\n",j,PSMALLINT_VALUE(fd));
+                FD_SET(PSMALLINT_VALUE(fd), fdsets[j]);
+                if (PSMALLINT_VALUE(fd) > sock)
+                    sock = PSMALLINT_VALUE(fd);
+            } else return ERR_TYPE_EXC;
+        }
     }
 
-    uint8_t *rlready = gc_malloc(rls);
+    printf("maxsock %i\n", sock);
 
     RELEASE_GIL();
-    i=-1;
-    tstart = vosMillis();
-    while(1){
-        i++;
-        if(i>=rls) {
-            //reset and check timeout
-            i=0;
-            if(timeout>=0 && (vosMillis()-tstart>timeout)) break;
-            vosThSleep(TIME_U(100,MILLIS)); //sleep a bit
-            //TODO: consider using RD URC to signal data ready for each socket
-            //and suspend here, avoiding polling (quite cumbersome tough)
-        }
-        tobj = PSEQUENCE_OBJECTS(rlist)[i];
-        sock = PSMALLINT_VALUE(tobj);
-        printf("S0 %i\n",sock);
-        if(sock>=0&&sock<MAX_SOCKS){
-            r = _gs_socket_available(sock);
-            if (r<=0) rlready[i]=0;
-            else rlready[i]=1;
-        }
-    }
-
-    PTuple* tpl = (PTuple*)psequence_new(PTUPLE, 3);
-    //count the number of ready sockets
-    tmp = 0;
-    for (j = 0; j < rls; j++) {
-        if (rlready[j]) tmp++;
-    }
-    //fill ready socket list
-    PTuple *rpl = ptuple_new(tmp,NULL);
-    tmp = 0;
-    for (j = 0; j < rls; j++) {
-        if (rlready[j]) {
-            PTUPLE_SET_ITEM(rpl,tmp,PSEQUENCE_OBJECTS(rlist)[j]);
-            tmp++;
-        }
-    }
-    PTUPLE_SET_ITEM(tpl,0,rpl);
-    //ignore wlist and elist: TODO, add this functionality
-    rpl = ptuple_new(0,NULL);
-    PTUPLE_SET_ITEM(tpl,1,rpl);
-    PTUPLE_SET_ITEM(tpl,2,rpl);
-    gc_free(rlready);
+    ret = gzsock_select( (sock + 1), fdsets[0], fdsets[1], fdsets[2], ptm );
     ACQUIRE_GIL();
 
+    printf("result: %i\n", ret);
+
+    if (ret < 0) {
+        return ERR_IOERROR_EXC;
+    }
+
+    PTuple *tpl = (PTuple *) psequence_new(PTUPLE, 3);
+    for (j = 0; j < 3; j++) {
+        tmp = 0;
+        for (i = 0; i <= sock; i++) {
+            if (FD_ISSET(i, fdsets[j])) tmp++;
+        }
+        PTuple *rtpl = psequence_new(PTUPLE, tmp);
+        tmp = 0;
+        for (i = 0; i <= sock; i++) {
+            //printf("sock %i in %i = %i\n",i,j,FD_ISSET(i, fdsets[j]));
+            if (FD_ISSET(i, fdsets[j])) {
+                PTUPLE_SET_ITEM(rtpl, tmp, PSMALLINT_NEW(i));
+                tmp++;
+            }
+        }
+        PTUPLE_SET_ITEM(tpl, j, rtpl);
+    }
     *res = tpl;
     return ERR_OK;
+
 }
 
 // /////////////////////SSL/TLS
@@ -793,6 +796,79 @@ C_NATIVE(_ug96_socket_select){
 C_NATIVE(_ug96_secure_socket)
 {
     C_NATIVE_UNWARN();
+#if defined ZERYNTH_SSL || defined NATIVE_MBEDTLS
+    int32_t err = ERR_OK;
+    int32_t sock;
+    int32_t i;
+    SSLInfo nfo;
+
+    int32_t family = DRV_AF_INET;
+    int32_t type = DRV_SOCK_STREAM;
+    int32_t proto = 6;
+    int32_t ssocknum = 0;
+    int32_t ctxlen;
+    uint8_t* certbuf = NULL;
+    uint16_t certlen = 0;
+    uint8_t* clibuf = NULL;
+    uint16_t clilen = 0;
+    uint8_t* pkeybuf = NULL;
+    uint16_t pkeylen = 0;
+    uint32_t options = _CLIENT_AUTH | _CERT_NONE;
+    uint8_t* hostbuf = NULL;
+    uint16_t hostlen = 0;
+
+    PTuple* ctx;
+    memset(&nfo,0,sizeof(nfo));
+    ctx = (PTuple*)args[nargs - 1];
+    nargs--;
+    
+    if (parse_py_args("III", nargs, args, DRV_AF_INET, &family, DRV_SOCK_STREAM, &type, 6, &proto) != 3){
+        return ERR_TYPE_EXC;
+    }
+    if (type != DRV_SOCK_DGRAM && type != DRV_SOCK_STREAM){
+        return ERR_TYPE_EXC;
+    }
+    if (family != DRV_AF_INET)
+        return ERR_UNSUPPORTED_EXC;
+    if(proto!=6)
+        return ERR_UNSUPPORTED_EXC;
+
+    ctxlen = PSEQUENCE_ELEMENTS(ctx);
+    if (ctxlen && ctxlen != 5)
+        return ERR_TYPE_EXC;
+
+    if (ctxlen) {
+        //ssl context passed
+        PObject* cacert = PTUPLE_ITEM(ctx, 0);
+        PObject* clicert = PTUPLE_ITEM(ctx, 1);
+        PObject* ppkey = PTUPLE_ITEM(ctx, 2);
+        PObject* host = PTUPLE_ITEM(ctx, 3);
+        PObject* iopts = PTUPLE_ITEM(ctx, 4);
+
+        nfo.cacert = PSEQUENCE_BYTES(cacert);
+        nfo.cacert_len = PSEQUENCE_ELEMENTS(cacert);
+        nfo.clicert = PSEQUENCE_BYTES(clicert);
+        nfo.clicert_len = PSEQUENCE_ELEMENTS(clicert);
+        nfo.hostname = PSEQUENCE_BYTES(host);
+        nfo.hostname_len = PSEQUENCE_ELEMENTS(host);
+        nfo.pvkey = PSEQUENCE_BYTES(ppkey);
+        nfo.pvkey_len = PSEQUENCE_ELEMENTS(ppkey);
+        nfo.options = PSMALLINT_VALUE(iopts);
+    }
+    RELEASE_GIL();
+    sock = gzsock_socket(
+          family,
+          type,
+          proto,
+          (ctxlen) ? &nfo:NULL);
+    ACQUIRE_GIL();
+    printf("CMD_SOCKET: %i %i\n", sock, type);
+    if (sock < 0)
+      return ERR_IOERROR_EXC;
+    *res = PSMALLINT_NEW(sock);
+    return ERR_OK;    
+
+#else 
     int32_t err = ERR_OK;
     int32_t family = DRV_AF_INET;
     int32_t type = DRV_SOCK_STREAM;
@@ -900,6 +976,7 @@ C_NATIVE(_ug96_secure_socket)
     ACQUIRE_GIL();
 
     return err;
+#endif
 }
 
 
@@ -912,18 +989,26 @@ C_NATIVE(_ug96_resolve){
     uint32_t len;
     uint8_t saddr[16];
     uint32_t saddrlen;
-    int err = ERR_OK;
+    int ret;
     if (parse_py_args("s", nargs, args, &url, &len) != 1)
         return ERR_TYPE_EXC;
+
+    struct addrinfo *ip;
+    uint8_t *node = gc_malloc(len+1);
+    memcpy(node,url,len); //get a zero terminated string
     RELEASE_GIL();
-    saddrlen = _gs_resolve(url,len,saddr);
-    if(saddrlen>0) {
-        *res = pstring_new(saddrlen,saddr);
-    } else {
-        err = ERR_IOERROR_EXC;
-    }
+    ret = zsock_getaddrinfo(node,NULL,NULL,&ip);
+    gc_free(node);
     ACQUIRE_GIL();
-    return err;
+    if (ret==ERR_OK) {
+        saddrlen=zs_addr_to_string(ip->ai_addr,saddr);
+        zsock_freeaddrinfo(ip);
+        if(saddrlen>0) {
+            *res = pstring_new(saddrlen,saddr);
+            return ERR_OK;
+        } 
+    }
+    return ERR_IOERROR_EXC;
 }
 
 

@@ -67,7 +67,24 @@ def init(serial,dtr,rts,poweron,reset,status,kill,status_on=1,pe=None):
     __builtins__.__default_net["ssl"] = __module__
     __builtins__.__default_net["sock"][0] = __module__ #AF_INET
 
-@c_native("_ug96_init",["csrc/ug96.c","csrc/ug96_ifc.c"])
+@c_native("_ug96_init",[
+    "csrc/ug96.c",
+    "csrc/ug96_ifc.c",
+    "#csrc/misc/zstdlib.c",
+    "#csrc/zsockets/*",
+#-if ZERYNTH_SSL
+    "#csrc/tls/mbedtls/library/*",
+    "#csrc/misc/snprintf.c",
+#-endif
+    ],
+    ["ZERYNTH_SOCKETS"],
+    [
+#-if ZERYNTH_SSL
+    "-I#csrc/tls/mbedtls/include",
+    "-I#csrc/misc",
+#-endif
+    "-I#csrc/zsockets"
+    ])
 def _init(serial,dtr,rst,poweron,reset,status,kill,status_on,exc):
     pass
 
