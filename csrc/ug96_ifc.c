@@ -1,10 +1,7 @@
-// #define ZERYNTH_PRINTF
 #include "zerynth.h"
-#include "ug96_ifc.h"
+#include "ug96.h"
 
-// #define printf(...) vbl_printf_stdout(__VA_ARGS__)
-
-//a reference to a Python exception to be returned on error (g350Exception)
+//a reference to a Python exception to be returned on error (ug96Exception)
 int32_t ug96exc;
 
 ///////// CNATIVES
@@ -12,15 +9,9 @@ int32_t ug96exc;
 // Functions starting with "_" are utility functions called by CNatives
 
 
-/**
- * @brief strings for network types
- */
-uint8_t *_urats = "GSMUMTS";
-uint8_t _uratpos[] = {0,3};
-uint8_t _uratlen[] = {3,4};
 SocketAPIPointers ug96_api;
 /**
- * @brief _g350_init calls _gs_init, _gs_poweron and _gs_config0
+ * @brief Init modem driver, calls _gs_init, gzsock_init
  *
  * As last parameter, requires an integer saved to global ug96exc, representing the name assigned to ug96Exception
  * so that it can be raised by returning ug96exc. If modules initialization is successful, the next step is calling startup
@@ -29,20 +20,13 @@ SocketAPIPointers ug96_api;
 C_NATIVE(_ug96_init){
     NATIVE_UNWARN();
     int32_t serial;
-    int32_t rx;
-    int32_t tx;
     int32_t rts;
     int32_t dtr;
-    int32_t poweron;
-    int32_t reset;
-    int32_t status;
-    int32_t status_on;
-    int32_t kill;
     int32_t err = ERR_OK;
     int32_t exc;
 
 
-    if (parse_py_args("iiiiiiiii", nargs, args, &serial, &dtr, &rts, &poweron, &reset, &status, &kill, &status_on, &exc) != 9)
+    if (parse_py_args("iiii", nargs, args, &serial, &dtr, &rts, &exc) != 4)
         return ERR_TYPE_EXC;
 
     ug96exc = exc;
@@ -57,12 +41,7 @@ C_NATIVE(_ug96_init){
     gs.tx = _vm_serial_pins[gs.serial].txpin;
     gs.dtr = dtr;
     gs.rts = rts;
-    gs.poweron = poweron;
-    gs.reset = reset;
-    gs.status = status;
-    gs.status_on = status_on;
-    gs.kill = kill;
-    printf("After init\n");
+
     ACQUIRE_GIL();
     ug96_api.socket = ug96_gzsock_socket;
     ug96_api.connect = ug96_gzsock_connect;
@@ -87,118 +66,146 @@ C_NATIVE(_ug96_init){
     ug96_api.inet_addr = NULL;
     ug96_api.inet_ntoa = NULL;
 
+    printf("After init\n");
     gzsock_init(&ug96_api);
-
+    printf("After gzsock_init\n");
     return err;
 }
 
-
-
+/**
+ * @brief Setup modem serial port, AT configuration and start modem thread
+ *
+ */
 C_NATIVE(_ug96_startup){
     NATIVE_UNWARN();
     int32_t err = ERR_OK;
-    int32_t skip_poweron;
     *res = MAKE_NONE();
     
-    if(parse_py_args("i",nargs,args,&skip_poweron)!=1) return ERR_TYPE_EXC;
-
     RELEASE_GIL();
-    //Init serial
-    gs.talking=0;
-    vhalSerialDone(gs.serial);
-    vhalSerialInit(gs.serial, 115200, SERIAL_CFG(SERIAL_PARITY_NONE,SERIAL_STOP_ONE, SERIAL_BITS_8,0,0), gs.rx, gs.tx);
-    if (!skip_poweron) {
-        //setup pins
-        printf("Setting pins\n");
-        vhalPinSetMode(gs.status,PINMODE_INPUT_PULLUP);
-        vhalPinSetMode(gs.poweron,PINMODE_OUTPUT_PUSHPULL);
-        // vhalPinSetMode(gs.reset,PINMODE_OUTPUT_PUSHPULL);
-        if (!_gs_poweron()) err = ERR_HARDWARE_INITIALIZATION_ERROR;
+    vosSemWait(gs.slotlock);
+
+    if (_gs_stop() != 0)
+        err = ERR_HARDWARE_INITIALIZATION_ERROR;
+    else
+    if (vhalSerialInit(gs.serial, 115200, SERIAL_CFG(SERIAL_PARITY_NONE,SERIAL_STOP_ONE, SERIAL_BITS_8,0,0), gs.rx, gs.tx) != 0)
+        err = ERR_HARDWARE_INITIALIZATION_ERROR;
+    else
+    if (!_gs_config0())
+        err = ERR_HARDWARE_INITIALIZATION_ERROR;
+    else {
+        if (gs.thread==NULL){
+            //let's start modem thread (if not already started)
+            printf("Starting modem thread with size %i\n",VM_DEFAULT_THREAD_SIZE);
+            gs.thread = vosThCreate(VM_DEFAULT_THREAD_SIZE,VOS_PRIO_NORMAL,_gs_loop,NULL,NULL);
+            vosThResume(gs.thread);
+            vosThSleep(TIME_U(1000,MILLIS)); // let modem thread have a chance to start
+        }
     }
+    // reset driver status (assuming modem has restarted)
+    gs.attached = 0;
+    gs.registered = 0;
+    gs.gsm_status = 0;
+    gs.gprs_status = 0;
+    gs.registration_status_time = (uint32_t)(vosMillis() / 1000);
 
-    if(!_gs_config0()) err = ERR_HARDWARE_INITIALIZATION_ERROR;
+    // start loop and wait
+    if (_gs_start() != 0)
+        err = ERR_HARDWARE_INITIALIZATION_ERROR;
 
+    vosSemSignal(gs.slotlock);
     ACQUIRE_GIL();
-    if(err==ERR_OK && gs.thread==NULL){
-        //let's start modem thread (if not already started)
-        printf("Starting modem thread with size %i\n",VM_DEFAULT_THREAD_SIZE);
-        gs.thread = vosThCreate(VM_DEFAULT_THREAD_SIZE,VOS_PRIO_NORMAL,_gs_loop,NULL,NULL);
-        vosThResume(gs.thread);
-        vosThSleep(TIME_U(1000,MILLIS)); // let modem thread have a chance to start
-    }
     return err;
 }
 
-
+/**
+ * @brief Stop modem thread and close serial port
+ *
+ * Optionally power-down modem (since hw method not available)
+ */
 C_NATIVE(_ug96_shutdown){
     NATIVE_UNWARN();
+    int32_t use_atcmd;
     int32_t err = ERR_OK;
-    int32_t skip_poweroff;
     *res = MAKE_NONE();
     
-    if(parse_py_args("i",nargs,args,&skip_poweroff)!=1) return ERR_TYPE_EXC;
-
     RELEASE_GIL();
-    gs.talking=0;
-    if (!skip_poweroff) {
-        //setup pins
-        printf("Setting pins\n");
-        _gs_poweroff();
-    }
+    vosSemWait(gs.slotlock);
 
+    if (_gs_stop() != 0)
+        err = ERR_HARDWARE_INITIALIZATION_ERROR;
+
+    // attempt normal shutdown
+    vhalSerialInit(gs.serial, 115200, SERIAL_CFG(SERIAL_PARITY_NONE,SERIAL_STOP_ONE, SERIAL_BITS_8,0,0), gs.rx, gs.tx);
+    // check alive
+    vhalSerialWrite(gs.serial, "ATE0\r\n", 6);
+    if (_gs_wait_for_ok(500)) {
+        //enter minimal functionality
+        vhalSerialWrite(gs.serial, "AT+CFUN=0\r\n", 11);
+        _gs_wait_for_ok(15000);
+        //power down
+        vhalSerialWrite(gs.serial, "AT+QPOWD\r\n", 10);
+        *res = PSMALLINT_NEW(1);
+    }
+    vhalSerialDone(gs.serial);
+
+    vosSemSignal(gs.slotlock);
     ACQUIRE_GIL();
     return err;
 }
 
+/**
+ * @brief Stop/restart modem thread
+ *
+ * Give direct access to modem serial port
+ */
+C_NATIVE(_ug96_bypass){
+    NATIVE_UNWARN();
+    int32_t mode;
+    int32_t err=ERR_OK;
+
+    if(parse_py_args("i",nargs,args,&mode)!=1) return ERR_TYPE_EXC;
+
+    *res = MAKE_NONE();
+    if (mode) {
+        vosSemWait(gs.slotlock);
+        if (_gs_stop() != 0)
+            err = ERR_HARDWARE_INITIALIZATION_ERROR;
+    }
+    else {
+        if (_gs_start() != 0)
+            err = ERR_HARDWARE_INITIALIZATION_ERROR;
+        vosSemSignal(gs.slotlock);
+    }
+    return err;
+}
 
 
-
-
-// /**
-//  * @brief _ug96_detach removes the link with the APN while keeping connected to the GSM network
-//  *
-//  *
-//  */
+/**
+ * @brief _ug96_detach removes the link with the APN while keeping connected to the GSM network
+ *
+ *
+ */
 C_NATIVE(_ug96_detach){
     NATIVE_UNWARN();
     int err = ERR_OK;
-    int r,timeout=10000;
     *res = MAKE_NONE();
     RELEASE_GIL();
-    if(!_gs_control_psd(0)) goto exit;
 
-    r = _gs_attach(0);
-    if(r) {
-        if (r==GS_ERR_TIMEOUT) err = ERR_TIMEOUT_EXC;
-        else err = ug96exc;
-        goto exit;
-    }
-    while(timeout>0){
-        _gs_check_network();
-        _gs_is_attached();
-        if (!gs.attached) break;
-        vosThSleep(TIME_U(100,MILLIS));
-        timeout-=100;
-    }
-    if(timeout<0) {
-        err = ERR_TIMEOUT_EXC;
-        goto exit;
-    }
+    if(!_gs_control_psd(0))
+        err = ug96exc;
 
-exit:
     ACQUIRE_GIL();
     return err;
 }
 
 
-
-// /**
-//  * @brief _ug96_attach tries to link to the given APN
-//  *
-//  * This function can block for a very long time (up to 2 minutes) due to long timeout of used AT commands
-//  *
-//  *
-//  */
+/**
+ * @brief _ug96_attach tries to link to the given APN
+ *
+ * This function can block for a very long time (up to 2 minutes) due to long timeout of used AT commands
+ *
+ *
+ */
 C_NATIVE(_ug96_attach){
     NATIVE_UNWARN();
     uint8_t *apn;
@@ -209,57 +216,36 @@ C_NATIVE(_ug96_attach){
     uint32_t password_len;
     uint32_t authmode;
     int32_t timeout;
-    int32_t wtimeout;
     int32_t err=ERR_OK;
 
-    int i,j;
-
-
-    if(parse_py_args("sssii",nargs,args,&apn,&apn_len,&user,&user_len,&password,&password_len,&authmode,&wtimeout)!=5) return ERR_TYPE_EXC;
+    if(parse_py_args("sssii",nargs,args,&apn,&apn_len,&user,&user_len,&password,&password_len,&authmode,&timeout)!=5) return ERR_TYPE_EXC;
 
     *res = MAKE_NONE();
     RELEASE_GIL();
 
-    //Attach to GPRS
-    for (j=0;j<5;j++){
-        i = _gs_attach(1);
-        if(i && j==4) {
-            if (i==GS_ERR_TIMEOUT) err = ERR_TIMEOUT_EXC;
-            else err = ug96exc;
-            goto exit;
-        } else if(i) {
-            vosThSleep(TIME_U(1000*(j+1),MILLIS));
-        } else {
-            break;
-        }
-    }
-    timeout=wtimeout;
+    //Wait for registration
+    _gs_check_network();
     while(timeout>0){
+        if (gs.registered>=GS_REG_OK) break;
+        vosThSleep(TIME_U(1000,MILLIS));
+        timeout-=1000;
         _gs_check_network();
-        _gs_is_attached();
-        if ((gs.registered==GS_REG_OK || gs.registered==GS_REG_ROAMING)&&(gs.attached)) break;
-        vosThSleep(TIME_U(100,MILLIS));
-        timeout-=100;
     }
-    if(timeout<0) {
+    if (gs.registered<GS_REG_OK) {
         err = ERR_TIMEOUT_EXC;
         goto exit;
     }
-
     //configure PSD
     err = ug96exc;
     if(!_gs_configure_psd(apn,apn_len,user,user_len,password,password_len,authmode)) goto exit;
 
-
     //activate PSD
-    gs.attached = 0;
     if(!_gs_control_psd(1)) goto exit;
 
     err = ERR_OK;
 
     exit:
     ACQUIRE_GIL();
-    *res = MAKE_NONE();
     return err;
 }
 
@@ -276,7 +262,6 @@ C_NATIVE(_ug96_operators){
 
     RELEASE_GIL();
     i = _gs_list_operators();
-    ACQUIRE_GIL();
     if (i){
         *res = MAKE_NONE();
         return ERR_OK;
@@ -291,6 +276,7 @@ C_NATIVE(_ug96_operators){
         PTUPLE_SET_ITEM(tpl,i,tpi);
     }
 
+    ACQUIRE_GIL();
     *res = tpl;
     return ERR_OK;
 }
@@ -324,7 +310,7 @@ C_NATIVE(_ug96_set_operator){
 
 
 /**
- * @brief _g350_rssi return the signal strength as reported by +CIEV urc
+ * @brief _ug96_rssi return the signal strength as reported by +CIEV urc
  *
  *
  */
@@ -343,48 +329,60 @@ C_NATIVE(_ug96_rssi){
     return ERR_OK;
 }
 
-
-
-
+/**
+ * @brief strings for network types (must have the same order as bits in GS_RAT_xxx)
+ */
+const uint8_t * const _urats[] = { "", "GSM","GPRS","UMTS" };
+#define MAX_URATS (sizeof(_urats)/sizeof(*_urats))
 
 /**
- * @brief _g450_network_info retrieves network information through +URAT and *CGED
+ * @brief _ug96_network_info retrieves network information through +URAT and *CGED
  *
  *
  */
 C_NATIVE(_ug96_network_info){
     NATIVE_UNWARN();
     int p0,l0,mcc,mnc;
-    PString *urat;
+    PString *str;
     PTuple *tpl = ptuple_new(8,NULL);
-    uint8_t bsi[5];
+    uint8_t rats[40];
+    int ratslen;
 
     //RAT  : URAT
     //CELL : UCELLINFO
     RELEASE_GIL();
     _gs_check_network();
     _gs_is_attached();
-    
-    // get tech string (slice) from pre-allocated buffer
-    if (gs.tech==0) p0=0;
-    else if (gs.tech==2) p0=1;
-    else p0=0;
-    urat = pstring_new(_uratlen[p0],_urats+_uratpos[p0]);
-    PTUPLE_SET_ITEM(tpl,0,urat);
-
     if (_gs_cell_info(&mcc, &mnc) <= 0) {
         mcc = -1;
         mnc = -1;
     }
+    
+    // build RAT (radio access technology) string from static buffer
+    // e.g. "GSM+LTE Cat M1"
+    ratslen = 0;
+    for (p0=1,l0=1; p0<MAX_URATS; ++p0,l0<<=1) {
+        if (gs.tech & l0) {
+            int len = strlen(_urats[p0]);
+            if (ratslen + len + 1 > sizeof(rats)) break; // for safety
+            if (ratslen > 0)
+                rats[ratslen++] = '+';
+            memcpy(rats+ratslen, _urats[p0], len);
+            ratslen += len;
+        }
+    }
+    str = pstring_new(ratslen,rats);
+    PTUPLE_SET_ITEM(tpl,0,str);
+
     PTUPLE_SET_ITEM(tpl,1,PSMALLINT_NEW(mcc));
     PTUPLE_SET_ITEM(tpl,2,PSMALLINT_NEW(mnc));
-    urat = pstring_new(0,NULL);
-    PTUPLE_SET_ITEM(tpl,3,urat);
+    str = pstring_new(0,NULL);
+    PTUPLE_SET_ITEM(tpl,3,str);
 
-    urat = pstring_new(strlen(gs.lac),gs.lac);
-    PTUPLE_SET_ITEM(tpl,4,urat);
-    urat = pstring_new(strlen(gs.ci),gs.ci);
-    PTUPLE_SET_ITEM(tpl,5,urat);
+    str = pstring_new(strlen(gs.lac),gs.lac);
+    PTUPLE_SET_ITEM(tpl,4,str);
+    str = pstring_new(strlen(gs.ci),gs.ci);
+    PTUPLE_SET_ITEM(tpl,5,str);
 
     //registered to network
     PTUPLE_SET_ITEM(tpl,6,(gs.registered==GS_REG_OK || gs.registered==GS_REG_ROAMING) ? PBOOL_TRUE():PBOOL_FALSE());
@@ -397,7 +395,7 @@ C_NATIVE(_ug96_network_info){
 }
 
 /**
- * @brief _g350_mobile_info retrieves info on IMEI and SIM card by means of +CGSN and *CCID
+ * @brief _ug96_mobile_info retrieves info on IMEI and SIM card by means of +CGSN and *CCID
  *
  *
  */
@@ -412,6 +410,7 @@ C_NATIVE(_ug96_mobile_info){
     RELEASE_GIL();
     im_len = _gs_imei(imei);
     ic_len = _gs_iccid(iccid);
+
     if(im_len<=0) {
         PTUPLE_SET_ITEM(tpl,0,pstring_new(0,NULL));
     } else {
@@ -428,7 +427,7 @@ C_NATIVE(_ug96_mobile_info){
 }
 
 /**
- * @brief _g350_link_info retrieves ip and dns by means of +UPSND
+ * @brief _ug96_link_info retrieves ip and dns by means of +UPSND
  *
  *
  */
@@ -455,10 +454,11 @@ C_NATIVE(_ug96_link_info){
         dns = pstring_new(0,NULL);
     }
 
-    ACQUIRE_GIL();
     PTuple *tpl = ptuple_new(2,NULL);
     PTUPLE_SET_ITEM(tpl,0,ips);
     PTUPLE_SET_ITEM(tpl,1,dns);
+
+    ACQUIRE_GIL();
     *res = tpl;
     return ERR_OK;
 }
@@ -491,7 +491,6 @@ C_NATIVE(_ug96_socket_create){
         return ERR_IOERROR_EXC;
     } 
     *res = PSMALLINT_NEW(sock_id);
-
     return ERR_OK;
 }
 
@@ -528,7 +527,7 @@ C_NATIVE(_ug96_socket_close) {
     if (parse_py_args("i", nargs, args, &sock) != 1)
         return ERR_TYPE_EXC;
     RELEASE_GIL();
-    ret = gzsock_close(sock);//_gs_socket_close(sock);
+    ret = gzsock_close(sock);
     ACQUIRE_GIL();
     *res = PSMALLINT_NEW(ret);
     return ERR_OK;
@@ -793,8 +792,7 @@ C_NATIVE(_ug96_socket_select){
 #define _CLIENT_AUTH 8
 #define _SERVER_AUTH 16
 
-C_NATIVE(_ug96_secure_socket)
-{
+C_NATIVE(_ug96_secure_socket) {
     C_NATIVE_UNWARN();
 #if defined ZERYNTH_SSL || defined NATIVE_MBEDTLS
     int32_t err = ERR_OK;
@@ -939,7 +937,6 @@ C_NATIVE(_ug96_secure_socket)
     if(err==ERR_OK) {
         //let's configure tls
 
-
         //NOTE: ZERYNTH CERTS END with \0
         if(options&_CERT_NONE) {
            //NO CACERT VERIFICATION
@@ -974,7 +971,6 @@ C_NATIVE(_ug96_secure_socket)
     }
 
     ACQUIRE_GIL();
-
     return err;
 #endif
 }
@@ -993,9 +989,18 @@ C_NATIVE(_ug96_resolve){
     if (parse_py_args("s", nargs, args, &url, &len) != 1)
         return ERR_TYPE_EXC;
 
+    // if arg is already numeric IP address, return it!
+    struct sockaddr_in addr;
+    ret = zs_string_to_addr(url,len,&addr);
+    if (ret == ERR_OK) {
+        *res = args[0];
+        return ERR_OK;
+    }
+    // otherwise resolve IP address
     struct addrinfo *ip;
     uint8_t *node = gc_malloc(len+1);
-    memcpy(node,url,len); //get a zero terminated string
+    memcpy(node,url,len);
+    node[len] = 0; //get a zero terminated string
     RELEASE_GIL();
     ret = zsock_getaddrinfo(node,NULL,NULL,&ip);
     gc_free(node);
@@ -1062,11 +1067,14 @@ C_NATIVE(_ug96_sms_send){
 
     RELEASE_GIL();
     mr = _gs_sms_send(num,numlen,txt,txtlen);
-    if (mr==-1) {
-        *res = PSMALLINT_NEW(-1);
-    } else if (mr<0) err = ug96exc;
-    else *res = pinteger_new(mr);
     ACQUIRE_GIL();
+
+    if (mr == -1)
+        *res = PSMALLINT_NEW(-1);
+    else if (mr < 0)
+        err = ug96exc;
+    else
+        *res = pinteger_new(mr);
     return err;
 }
 
@@ -1142,10 +1150,10 @@ C_NATIVE(_ug96_sms_delete){
 
     RELEASE_GIL();
     rd = _gs_sms_delete(index);
-    if (rd<0) *res=PBOOL_FALSE();
     ACQUIRE_GIL();
-    return err;
 
+    if (rd<0) *res=PBOOL_FALSE();
+    return err;
 }
 
 C_NATIVE(_ug96_sms_get_scsa){
@@ -1174,8 +1182,9 @@ C_NATIVE(_ug96_sms_set_scsa){
 
     RELEASE_GIL();
     rd = _gs_sms_set_scsa(scsa,scsalen);
-    if (rd<0) *res = PBOOL_FALSE();
     ACQUIRE_GIL();
+
+    if (rd<0) *res = PBOOL_FALSE();
     return err;
 }
 

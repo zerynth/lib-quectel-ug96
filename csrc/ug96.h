@@ -1,4 +1,5 @@
 #include "zerynth.h"
+
 #define ZERYNTH_SOCKETS
 #if !defined(UG96_MAX_SOCKS)
 #define MAX_SOCKS 4
@@ -8,20 +9,25 @@
 #include "zerynth_sockets.h"
 
 
+//Enable/Disable debug printf
+#define QUECTEL_UG96_DEBUG 0
+#define DEBUG_CHANNEL 0
 
-#define SER_CHANNEL 2
-
-static void my_vbl_printf(uint8_t* fmt, ...)
+#if QUECTEL_UG96_DEBUG
+static void debug_printf(const char* fmt, ...)
 {
     va_list vl;
     va_start(vl, fmt);
-    vbl_printf((uint32_t)&vhalSerialWrite | 1, SER_CHANNEL, (uint8_t*)fmt, &vl);
+    vbl_printf((void*)((uint32_t)&vhalSerialWrite | 1), DEBUG_CHANNEL, (uint8_t*)fmt, &vl);
     va_end(vl);
 }
-#define print_buffer(buf, len) vhalSerialWrite(SER_CHANNEL, buf, len)
+#define printf(...) debug_printf(__VA_ARGS__)
+#define print_buffer(buf, len) vhalSerialWrite(DEBUG_CHANNEL, buf, len)
+#else
 #define printf(...)
-//#define printf(...) my_vbl_printf(__VA_ARGS__)
-//#define printf(...) vbl_printf_stdout(__VA_ARGS__)
+#define print_buffer(buf, len)
+#endif
+
 
 #define MAX_BUF 1024
 #define MAX_CMD 545
@@ -109,14 +115,15 @@ typedef struct _gs_sms {
 ////////////GSM STATUS
 
 typedef struct _gsm_status {
-    uint8_t initialized;
-    uint8_t talking;
+    uint8_t volatile initialized;
+    uint8_t volatile talking;
+    uint8_t volatile running;
     uint8_t attached;
     uint8_t registered;
     uint32_t registration_status_time;
-    uint8_t status_on;
-    uint8_t gprs;
-    uint8_t gprs_mode;
+    uint8_t gsm_status;
+    uint8_t gprs_status;
+    uint8_t gprs_act;
     uint8_t errlen;
     uint8_t mode;
     uint8_t rssi;
@@ -125,10 +132,6 @@ typedef struct _gsm_status {
     uint16_t rts;
     uint16_t rx;
     uint16_t tx;
-    uint16_t poweron;
-    uint16_t reset;
-    uint16_t status;
-    uint16_t kill;
     uint16_t bytes;
     GSSlot* slot;
     VSemaphore sendlock;
@@ -162,10 +165,18 @@ typedef struct _gsm_status {
 #define GS_ERR_TIMEOUT 1
 #define GS_ERR_INVALID 2
 
-#define GS_REG_DENIED 2
+// keep order, so that >= OK is registered
 #define GS_REG_NOT 0
-#define GS_REG_OK 1
-#define GS_REG_ROAMING 3
+#define GS_REG_UNKNOWN 1
+#define GS_REG_SEARCH 2
+#define GS_REG_DENIED 3
+#define GS_REG_OK 4
+#define GS_REG_ROAMING 5
+
+// Radio Access Technology (bit field)
+#define GS_RAT_GSM      0x01
+#define GS_RAT_GPRS     0x02
+#define GS_RAT_UMTS     0x04
 
 #define KNOWN_COMMANDS (sizeof(gs_commands) / sizeof(GSCmd))
 #define GS_MIN(a) (((a) < (gs.bytes)) ? (a) : (gs.bytes))
@@ -196,6 +207,7 @@ enum {
     GS_CMD_CGDCONT,
     GS_CMD_CGEREP,
     GS_CMD_CGEV,
+    GS_CMD_CGREG,
     GS_CMD_CMEE,
     GS_CMD_CMGD,
     GS_CMD_CMGF,
@@ -253,6 +265,7 @@ static const GSCmd gs_commands[] = {
     DEF_CMD("+CGDCONT", GS_RES_OK, GS_CMD_NORMAL, GS_CMD_CGDCONT),
     DEF_CMD("+CGEREP", GS_RES_OK, GS_CMD_NORMAL, GS_CMD_CGEREP),
     DEF_CMD("+CGEV", GS_RES_OK, GS_CMD_URC, GS_CMD_CGEV),
+    DEF_CMD("+CGREG", GS_RES_OK, GS_CMD_NORMAL | GS_CMD_URC, GS_CMD_CGREG),
     DEF_CMD("+CMEE", GS_RES_OK, GS_CMD_NORMAL, GS_CMD_CMEE),
 
     DEF_CMD("+CMGD", GS_RES_OK, GS_CMD_NORMAL, GS_CMD_CMGD),
@@ -322,17 +335,18 @@ extern int gsopn;
             
 
 void _gs_init(void);
-void _gs_done(void);
-int _gs_poweroff(void);
-int _gs_poweron(void);
+int _gs_start(void);
+int _gs_stop(void);
+int _gs_config0(void);
 void _gs_loop(void* args);
 int _gs_list_operators(void);
 int _gs_set_operator(uint8_t* operator, int oplen);
 int _gs_check_network(void);
-int _gs_set_network_status_from_creg(uint8_t* buf, uint8_t* ebuf, int from_urc);
 int _gs_control_psd(int activate);
-int _gs_config_psd();
+int _gs_config_psd(void);
 int _gs_configure_psd(uint8_t* apn, int apnlen, uint8_t* username, int ulen, uint8_t* pwd, int pwdlen, int auth);
+int _gs_set_gsm_status_from_creg(uint8_t* buf, uint8_t* ebuf, int from_urc);
+int _gs_set_gprs_status_from_cgreg(uint8_t* buf, uint8_t* ebuf, int from_urc);
 int _gs_set_rat(int rat, int band);
 
 int _gs_get_rtc(uint8_t* time);

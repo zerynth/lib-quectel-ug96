@@ -5,7 +5,7 @@
 UG96 Module
 ***********
 
-This module implements the Zerynth driver for the Quectel UG95/UG96 UMTS/HSPA modem (`Product page <https://www.quectel.com/product/2g3g.htm>`_).
+This module implements the Zerynth driver for the Quectel UG95/UG96 UMTS/HSPA chip (`Product page <https://www.quectel.com/product/2g3g.htm>`_).
 
 The driver must be used together with the standard library :ref:`GSM Module <stdlib_gsm>`.
 
@@ -22,61 +22,66 @@ The following functionalities are implemented:
     * SMS
 
 Listening sockets for TCP and UDP protocols are not implemented due to the nature of GSM networks. 
-Moreover, UDP sockets must be connected or bound explicitly in the code to select which kind of function to perform (send vs sendto and recv vs recvfrom).
+Moreover, UDP sockets must be connected or bind explicitly in the code to select which kind of function to perform (send vs sendto and recv vs recvfrom).
 
 The communication with UG96 is performed via UART without hardware flow control at 115200 baud.
 
 This module provides the :samp:`ug96Exception` to signal errors related to the hardware initialization and management.
 
    """
-import gpio
+import streams
+
 
 new_exception(ug96Exception, Exception)
-_reset_pin=None
-_reset_on=None
-_power_pin=None
-_power_on=None
-_status_pin=None
-_status_on=None
+_kill_pin=None
+_kill_on=None
 
-def init(serial,dtr,rts,power,kill,status,power_on=LOW,kill_on=LOW,status_on=HIGH):
+<<<<<<< Updated upstream
+def init(serial,dtr,rts,poweron,reset,status,kill,status_on=1, poweron_on = 0, kill_on = 0, pe=None):
+=======
+def init(serial,dtr,rts,power,kill,status,power_on=0,kill_on=0,status_on=1,pe=None):
+>>>>>>> Stashed changes
     """
-.. function:: init(serial,dtr,rts,power,kill,status,power_on=LOW,kill_on=LOW,status_on=HIGH)
+.. function:: init(serial,dtr,rts,power,kill,status,status_on=1, pe=None)
 
     Initialize the UG96 device given the following parameters:
 
-    * *serial*, the serial port connected to the UG96 (:samp:`SERIAL1`, :samp:`SERIAL2`, etc...)
+    * *serial*, the serial port connected to the UG96 (:samp;`SERIAL1`,:samp:`SERIAL2`, etc..)
     * *dtr*, the DTR pin of UG96 (not used yet)
     * *rts*, the RTS pin of UG96 (not used yet)
-    * *power*, the power up pin of UG96
-    * *kill*, the emergency off (kill) pin of UG96
+    * *poweron*, the power up pin of UG96
+    * *reset*, the reset pin of UG96
     * *status*, the status pin of UG96
-    * *power_on*, the active level of the power up pin
-    * *kill_on*, the active level of the kill pin
-    * *status_on*, the value of status pin indicating successful power on (can be zero in some pcb designs)
+    * *kill*, the kill pin of UG96
+    * *status_on*, the value of status pin indicating successful poweron (can be zero in some pcb designs)
+    * *poweron_on*, the value of status pin indicating when the UG96 is powered (can be one in some pcb designs)
+    * *kill_on*, the value of status pin indicating successful poweron (can be zero in some pcb designs)
+    * *pe*, a port expander implementation
+
+    If *pe* is not None, the UG96 initialization is performed using *pe* to control the pins.
+    *pe* should be an instance of the :ref:`GPIO module <stdlib_gpio>`.
 
     """
-    global _kill_pin, _kill_on, _power_pin, _power_on, _status_pin, _status_on
+    global _kill_pin, _kill_on
+<<<<<<< Updated upstream
+    _kill_on = kill_on
+    _kill_pin=kill
+    _init(serial,dtr,rts,poweron,reset,status,kill,status_on, poweron_on, kill_on,__nameof(ug96Exception))
+    if pe:
+        _startup_py(serial,dtr,rts,poweron,reset,status,kill,status_on, poweron_on, kill_on ,pe)
+=======
     _kill_pin=kill
     _kill_on=kill_on
-    _power_pin=power
-    _power_on=power_on
-    _status_pin=status
-    _status_on=status_on
-
-    # print("Setting Pins...");
-    gpio.mode(_status_pin, INPUT_PULLDOWN if _status_on else INPUT_PULLUP)
-    gpio.mode(_kill_pin, OUTPUT_PUSHPULL)
-    gpio.set(_kill_pin, HIGH^ _kill_on)
-    gpio.mode(_power_pin, OUTPUT_PUSHPULL)
-    gpio.set(_power_pin, HIGH^ _power_on)
-
-    _init(serial,dtr,rts,__nameof(ug96Exception))
+    _init(serial,dtr,rts,power,kill,status,power_on,kill_on,status_on,__nameof(ug96Exception))
+    if pe:
+        _startup_py(serial,dtr,rts,power,kill,status,power_on,kill_on,status_on,pe)
+>>>>>>> Stashed changes
+        _startup(1)
+    else:
+        _startup(0)
     __builtins__.__default_net["gsm"] = __module__
     __builtins__.__default_net["ssl"] = __module__
     __builtins__.__default_net["sock"][0] = __module__ #AF_INET
-
-    shutdown(True)
 
 @c_native("_ug96_init",[
     "csrc/ug96.c",
@@ -90,95 +95,108 @@ def init(serial,dtr,rts,power,kill,status,power_on=LOW,kill_on=LOW,status_on=HIG
     ],
     ["ZERYNTH_SOCKETS"],
     [
-#-if ZERYNTH_SSL
     "-I#csrc/tls/mbedtls/include",
+#-if ZERYNTH_SSL
     "-I#csrc/misc",
 #-endif
     "-I#csrc/zsockets"
     ])
-def _init(serial,dtr,rst,exc):
+def _init(serial,dtr,rst,power,kill,status,power_on,kill_on,status_on,exc):
     pass
 
-@c_native("_ug96_shutdown",[])
-def _shutdown():
+@c_native("_ug96_shutdown",["csrc/ug96.c"])
+def _shutdown(skip_poweroff):
     pass
 
-@c_native("_ug96_startup",[])
-def _startup():
-    pass
-
-@c_native("_ug96_bypass",[])
-def bypass(mode):
+def shutdown(pe=None):
     """
-.. function:: bypass(mode)
+.. function:: shutdown(pe=None)
 
-    Bypass the modem driver to use the serial port directly. It has one parameter:
-
-    * *mode*, can be *1* (non-zero) to enter bypass mode, or *0* (zero) to exit.
-    
+    Power of the module by toggling the kill pin. If *pe* is given, a port expander is used to switch the pin.
     """
-    pass
-
-def shutdown(forced=False):
-    """
-.. function:: shutdown(forced=False)
-
-    Power off the module by sending AT command (clean power-down).
-
-    If *forced* is given, use emergency off (faster, do not detach from network).
-    """
-    timeout = 125
-    if _shutdown():
-        # normal shutdown attempted
-        for i in range(timeout):
-            if gpio.get(_status_pin)!=_status_on:
-                # print("!STA")
-                break
-            # print("STA!")
-            sleep(100)
-    # print("Powering off...")
-    if gpio.get(_status_pin)==_status_on and forced:
-        gpio.set(_kill_pin, HIGH^ _kill_on)
-        sleep(500)
-        gpio.set(_kill_pin, _kill_on)
+    if pe:
+        _shutdown(1)
+        pe.set(_kill_pin,_kill_on)
+<<<<<<< Updated upstream
+        sleep(5000)
+        pe.set(_kill_pin, not _kill_on)
+=======
         sleep(200)
-        gpio.set(_kill_pin, HIGH^ _kill_on)
-        timeout = 15 # shorter
+        pe.set(_kill_pin,not _kill_on)
+>>>>>>> Stashed changes
+    else:
+        _shutdown(0)
 
-    for i in range(timeout):
-        if gpio.get(_status_pin)!=_status_on:
-            # print("!STA")
+@c_native("_ug96_startup",["csrc/ug96.c"])
+def _startup(skip_poweron):
+    pass
+
+<<<<<<< Updated upstream
+def _startup_py(serial,dtr,rts,poweron,reset,status,kill,status_on,poweron_on, kill_on, pe):
+    # print("Setting Pins...");
+    pe.mode(status,INPUT);
+    pe.mode(kill,OUTPUT_PUSHPULL);
+    pe.set(kill, not kill_on);
+    pe.mode(poweron,OUTPUT_PUSHPULL);
+    pe.set(poweron, not poweron_on)
+    pe.mode(reset,OUTPUT_PUSHPULL);
+
+    # print("Powering off...");
+    pe.set(kill,kill_on)
+    for i in range(50):
+        if pe.get(status)!=status_on:
+            pe.set(kill,not kill_on)
             break
-        # print("STA!")
         sleep(100)
     else:
-        raise HardwareInitializationError
+        pe.set(kill,not kill_on)
+=======
+def _startup_py(serial,dtr,rts,power,kill,status,power_on,kill_on,status_on,pe):
+    # print("Setting Pins...");
+    pe.mode(status,INPUT)
+    pe.mode(kill,OUTPUT_PUSHPULL)
+    pe.set(kill, not kill_on)
+    pe.mode(power,OUTPUT_PUSHPULL)
+    pe.set(power, not power_on)
+
     sleep(500)
 
-def startup():
-    """
-.. function:: startup()
-
-    Power on the module by pulsing the power pin. 
-    """
-    # print("Powering on...")
-    if gpio.get(_status_pin)!=_status_on:
-        gpio.set(_power_pin, HIGH^ _power_on)
-        sleep(500)
-        gpio.set(_power_pin, _power_on)
-        sleep(200)
-        gpio.set(_power_pin, HIGH^ _power_on)
-
+    # print("Powering off...");
+    pe.set(kill, kill_on)
+    sleep(200)
+    pe.set(kill, not kill_on)
     for i in range(50):
-        if gpio.get(_status_pin)==_status_on:
-            # print("STA!")
+        if pe.get(status)!=status_on:
             break
-        # print("!STA")
         sleep(100)
     else:
+>>>>>>> Stashed changes
         raise HardwareInitializationError
-    sleep(1500)
-    _startup()
+
+    sleep(500)
+    # print("Powering on...")
+<<<<<<< Updated upstream
+    pe.set(poweron,poweron_on)
+    sleep(1000)
+    pe.set(poweron, not poweron_on)
+    sleep(1000)
+    pe.set(poweron, poweron_on)
+=======
+    pe.set(power, power_on)
+    sleep(200)
+    pe.set(power, not power_on)
+>>>>>>> Stashed changes
+    for i in range(50):
+        if pe.get(status)==status_on:
+            # print("STA!")
+            break
+        else:
+            # print("!STA")
+            sleep(100)
+    else:
+        raise HardwareInitializationError
+
+
 
 @c_native("_ug96_attach",[])
 def attach(apn,username,password,authmode,timeout):
@@ -256,7 +274,7 @@ def recv_into(sock,buf,bufsize,flags=0,ofs=0):
     pass
 
 @native_c("_ug96_socket_recvfrom_into",[])
-def recvfrom_into(sock,buf,bufsize,flags=0,ofs=0):
+def recvfrom_into(sock,buf,bufsize,flags=0):
     pass
 
 @native_c("_ug96_secure_socket",[],[])

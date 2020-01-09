@@ -42,15 +42,6 @@
 
 #include "ug96.h"
 
-//Enable/Disable debug printf
-#define QUECTEL_UG96_DEBUG 0
-
-#if QUECTEL_UG96_DEBUG
-#define printf(...) vbl_printf_stdout(__VA_ARGS__)
-#else
-#define printf(...)
-#endif
-
 //STATIC VARIABLES
 
 //the UG96 driver status
@@ -65,7 +56,6 @@ GSOp gsops[MAX_OPS];
 //the number of GSM operators
 int gsopn=0;
 
-
 //Some declarations for URC socket handling
 void _gs_socket_closing(int id);
 void _gs_socket_pending(int id);
@@ -73,7 +63,7 @@ void _gs_socket_pending(int id);
 /**
  * @brief Initializes the data structures of ug96
  */
-void _gs_init()
+void _gs_init(void)
 {
     int i;
     if (!gs.initialized) {
@@ -92,104 +82,59 @@ void _gs_init()
         gs.pendingsms = 0;
         gs.initialized = 1;
         gs.talking = 0;
+        gs.running = 0;
     }
     //TODO: regardless of initialized status, reset all sockets
 }
 
 /**
- * @brief Clean up the data structures of ug96
- */
-void _gs_done()
-{
-    int i;
-    vhalSerialDone(gs.serial);
-}
-
-int _gs_power_status_on()
-{
-    return vhalPinRead(gs.status) == gs.status_on;
-}
-/**
- * @brief Begin the power off phase
- *
- * Starts power off sequence according to https://www.quectel.com/UploadImage/Downlad/Quectel_UG96_Hardware_Design_V1.3.pdf
- *
+ * @brief Start modem loop and wait for running state
  *
  * @return 0 on success
  */
-int _gs_poweroff()
+int _gs_start(void)
 {
     int i;
-
-    printf("Powering off...\n");
-
-    vhalPinSetMode(gs.kill, PINMODE_OUTPUT_PUSHPULL);
-    vhalPinWrite(gs.kill, 1);
-
-    //wait for power down to complete checking the status pin
-    for (i = 0; i < 50; i++) {
-        if (!_gs_power_status_on()) {
-            printf("Powered Down!\n");
-            break;
+    if (!gs.talking) {
+        gs.talking = 1;
+        for (i = 30; i > 0; --i) {
+            printf("waiting modem loop %i\n",i);
+            if (gs.running)
+                break;
+            vosThSleep(TIME_U(100, MILLIS));
         }
-        vosThSleep(TIME_U(100, MILLIS));
+        if (i == 0)
+            return GS_ERR_TIMEOUT;
     }
-    vhalPinWrite(gs.kill, 0);
-    vosThSleep(TIME_U(1000, MILLIS));
-    return 0;
+    if (!gs.running)
+        return GS_ERR_INVALID;
+    printf("started.\n");
+    return GS_ERR_OK;
 }
 
 /**
- * @brief Begin the power up phase
- *
- * Starts power on sequence according to https://www.quectel.com/UploadImage/Downlad/Quectel_UG96_Hardware_Design_V1.3.pdf
+ * @brief Stop modem loop and wait for idle state
  *
  * @return 0 on success
  */
-int _gs_poweron()
+int _gs_stop(void)
 {
     int i;
-
-    _gs_poweroff();
-
-    printf("Powering on...%x\n", gs.poweron);
-    vhalPinWrite(gs.poweron, 1);
-    vosThSleep(TIME_U(1000, MILLIS)); //wait for stabilization
-    vhalPinWrite(gs.poweron, 0);
-    vosThSleep(TIME_U(1000, MILLIS)); // >= 500ms
-    for (i = 0; i < 150; i++) {
-        if (_gs_power_status_on()) {
-            //status at 1, exit
-            printf("Up!\n");
-            break;
+    if (gs.talking) {
+        gs.talking = 0;
+        for (i = 50; i > 0; --i) {
+            printf("waiting modem loop %i\n",i);
+            if (!gs.running)
+                break;
+            vosThSleep(TIME_U(100, MILLIS));
         }
-        printf("Dn %i\n", i);
-        vosThSleep(TIME_U(100, MILLIS));
+        if (i == 0)
+            return GS_ERR_TIMEOUT;
     }
-    if (!_gs_power_status_on()) {
-        //status at 0, can't power up
-        printf("power on ko\n");
-        return 0;
-    }
-
-    return 1;
-}
-
-/**
- * @brief Read lines from the module until a "OK" is received
- *
- * @param[in]   timeout     the number of milliseconds to wait for each line
- *
- * @return 0 on failure
- */
-int _gs_wait_for_ok(int timeout)
-{
-    while (_gs_readline(timeout) >= 0) {
-        if (_gs_check_ok()) {
-            return 1;
-        }
-    }
-    return 0;
+    if (gs.running)
+        return GS_ERR_INVALID;
+    printf("stopped.\n");
+    return GS_ERR_OK;
 }
 
 /**
@@ -197,7 +142,7 @@ int _gs_wait_for_ok(int timeout)
  *
  * Use to discard old received data not pertaining to next command!
  */
-int _gs_empty_rx()
+void _gs_empty_rx(void)
 {
     int bytes = vhalSerialAvailable(gs.serial);
     while (bytes > 0) {
@@ -284,13 +229,30 @@ int _gs_read(int bytes)
  *
  * @return 0 on failure
  */
-int _gs_check_ok()
+int _gs_check_ok(void)
 {
-    return memcmp(gs.buffer, "OK\r\n", 4) == 0 && gs.bytes >= 4;
+    return gs.bytes >= 4 && memcmp(gs.buffer, "OK\r\n", 4) == 0;
 }
-int _gs_check_rdy()
+int _gs_check_rdy(void)
 {
-    return memcmp(gs.buffer, "RDY\r\n", 5) == 0 && gs.bytes >= 5;
+    return gs.bytes >= 5 && memcmp(gs.buffer, "RDY\r\n", 5) == 0;
+}
+
+/**
+ * @brief Read lines from the module until a "OK" is received
+ *
+ * @param[in]   timeout     the number of milliseconds to wait for each line
+ *
+ * @return 0 on failure
+ */
+int _gs_wait_for_ok(int timeout)
+{
+    while (_gs_readline(timeout) >= 0) {
+        if (_gs_check_ok()) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /**
@@ -302,14 +264,14 @@ int _gs_check_rdy()
  *
  * @return 0 on no error
  */
-int _gs_check_error()
+int _gs_check_error(void)
 {
-    if (memcmp(gs.buffer, "+CME ERROR: ", 12) == 0 && gs.bytes >= 12) {
+    if (gs.bytes >= 12 && memcmp(gs.buffer, "+CME ERROR: ", 12) == 0) {
         int elen = MIN(gs.bytes - 12, MAX_ERR_LEN);
         memcpy(gs.errmsg, gs.buffer + 12, elen);
         gs.errlen = elen;
         return 1;
-    } else if (memcmp(gs.buffer, "ERROR", 5) == 0 && gs.bytes >= 5) {
+    } else if (gs.bytes >= 5 && memcmp(gs.buffer, "ERROR", 5) == 0) {
         gs.errlen = 0;
         return 1;
     }
@@ -324,7 +286,7 @@ int _gs_check_error()
  *
  * @return NULL on failure, a pointer to a GSCmd structure otherwise
  */
-GSCmd* _gs_parse_command_response()
+GSCmd* _gs_parse_command_response(void)
 {
     int e0 = 0, e1 = KNOWN_COMMANDS - 1, c = -1, r = 0;
     GSCmd* cmd = NULL;
@@ -413,8 +375,8 @@ uint8_t* _gs_findstr(uint8_t* buf, uint8_t* ebuf, uint8_t* pattern)
  * @brief parse numbers in base 10 from a byte buffe 
  *
  * Does not check for number format correctness (0003 is ok) and
- * does not parse negative numbers. Skip spaces and \r \n without checking
- * if they break a number or not ("33 44" is parsed as 3344)
+ * does also parse negative numbers. Whitespace chars ' ','\r','\n'
+ * break the number, other chars before end point return NULL.
  *
  * @param[in]  buf     starting point
  * @param[in]  ebuf    ending point (not included)
@@ -425,16 +387,32 @@ uint8_t* _gs_findstr(uint8_t* buf, uint8_t* ebuf, uint8_t* pattern)
 uint8_t* _gs_parse_number(uint8_t* buf, uint8_t* ebuf, int32_t* result)
 {
     int res = 0;
+    int found = 0;
+    int sign=1;
     while (buf < ebuf) {
         if (*buf >= '0' && *buf <= '9') {
+            found = 1;
             res = res * 10 + (*buf - '0');
-        } else if (*buf != ' ' && *buf != '\r' && *buf != '\n') {
+        } else if(*buf=='-'){
+            if (found)
             return NULL; //allow spaces
+            found = 1;
+            sign=-1;
+        } else if (*buf == ' ') {
+            if (found)
+                break;
+        } else if (*buf == '\r' || *buf == '\n') {
+            if (found)
+                break;
+            else
+                return NULL;
+        } else {
+            return NULL;
         }
         buf++;
     }
     if (result)
-        *result = res;
+        *result = res*sign;
     return buf;
 }
 
@@ -525,7 +503,7 @@ exit:
  * is sent as is.
  *
  * @param[i] cmd_id  Macro identifying the command to send
- * @param[i] fmt     format string
+ * @param[i] fmt     format string (can be NULL)
  * @param[i] ...     variadic arguments
  */
 void _gs_send_at(int cmd_id, const char* fmt, ...)
@@ -543,6 +521,7 @@ void _gs_send_at(int cmd_id, const char* fmt, ...)
     printf("->: AT");
     vhalSerialWrite(gs.serial, cmd->body, cmd->len);
     printf("%s", cmd->body);
+    if (fmt)
     while (*fmt) {
         switch (*fmt) {
         case 'i':
@@ -555,12 +534,9 @@ void _gs_send_at(int cmd_id, const char* fmt, ...)
             break;
         case 's':
             sparam = va_arg(vl, uint8_t*);
-            iparam_len = va_arg(vl, int32_t*);
+            iparam_len = va_arg(vl, int32_t);
             vhalSerialWrite(gs.serial, sparam, iparam_len);
-#if defined(QUECTEL_UG96_DEBUG)
-            for (iparam = 0; iparam < iparam_len; iparam++)
-                printf("%c", sparam[iparam]);
-#endif
+            print_buffer(sparam, iparam_len);
             break;
         default:
             vhalSerialWrite(gs.serial, fmt, 1);
@@ -574,7 +550,7 @@ void _gs_send_at(int cmd_id, const char* fmt, ...)
     va_end(vl);
 }
 
-int _gs_wait_for_pin_ready()
+int _gs_wait_for_pin_ready(void)
 {
     int i;
     for (i = 3; i > 0; --i) {
@@ -596,23 +572,23 @@ int _gs_wait_for_pin_ready()
     return (i < 0);
 }
 
-int _gs_get_activity_status()
+int _gs_get_initialization_status(void)
 {
     uint8_t* p;
-    int32_t pas = -1; // unexpected/unknown
+    int32_t sta = -1; // unexpected/unknown
     int i;
 
-    vhalSerialWrite(gs.serial, "AT+CPAS\r\n", 9);
+    vhalSerialWrite(gs.serial, "AT+QINISTAT\r\n", 13);
     for (i = 10; i > 0; --i) {
         if (_gs_readline(100) >= 0) {
-            p = _gs_findstr(gs.buffer, gs.buffer + gs.bytes, "+CPAS:");
-            if (p && _gs_parse_number(p, gs.buffer + gs.bytes, &pas))
+            p = _gs_findstr(gs.buffer, gs.buffer + gs.bytes, "+QINISTAT:");
+            if (p && _gs_parse_number(p, gs.buffer + gs.bytes, &sta))
                 break;
         }
     }
     if (!_gs_wait_for_ok(500))
         return -1;
-    return pas;
+    return sta;
 }
 
 /**
@@ -622,7 +598,7 @@ int _gs_get_activity_status()
  *
  * @return 0 on failure
  */
-int _gs_config0()
+int _gs_config0(void)
 {
     //clean serial
     int i;
@@ -660,9 +636,7 @@ int _gs_config0()
     _gs_send_at(GS_CMD_CREG, "=i", 2);
     if (!_gs_wait_for_ok(500))
         return 0;
-
-    //enable urc about pdp status
-    _gs_send_at(GS_CMD_CGEREP, "=i", 2);
+    _gs_send_at(GS_CMD_CGREG, "=i", 2);
     if (!_gs_wait_for_ok(500))
         return 0;
 
@@ -670,20 +644,22 @@ int _gs_config0()
     vhalSerialWrite(gs.serial, "ATI\r\n", 5);
     if (!_gs_wait_for_ok(500))
         return 0;
+    vhalSerialWrite(gs.serial, "AT+QGMR\r\n", 9);
+    _gs_wait_for_ok(500);
+
     // wait for PIN ready
     if (!_gs_wait_for_pin_ready())
         return 0;
-    // wait for ME ready
-    for (i = 60; i > 0; --i) {
-        int pas = _gs_get_activity_status();
-        if (pas < 0)
-            return 0;
-        if (pas == 0 | pas == 3 | pas == 4)
+    // wait initialization complete
+   for (i = 50; i > 0; --i) {
+        int sta = _gs_get_initialization_status();
+        if (sta >= 3)
             break;
-        vosThSleep(TIME_U(1000, MILLIS));
+        vosThSleep(TIME_U(100, MILLIS));
     }
     if (i == 0)
         return 0;
+
     //timezone update
     vhalSerialWrite(gs.serial, "AT+CTZU=1\r\n", 11);
     if (!_gs_wait_for_ok(1500))
@@ -691,6 +667,11 @@ int _gs_config0()
 
     //set sms format
     vhalSerialWrite(gs.serial, "AT+CMGF=1\r\n", 11);
+    if (!_gs_wait_for_ok(500))
+        return 0;
+
+    //set text encoding
+    vhalSerialWrite(gs.serial, "AT+CSCS=\"IRA\"\r\n", 15);
     if (!_gs_wait_for_ok(500))
         return 0;
 
@@ -704,8 +685,11 @@ int _gs_config0()
     if (!_gs_wait_for_ok(500))
         return 0;
 
-    vosThSleep(TIME_U(1000, MILLIS));
-    gs.talking = 1;
+    //enable urc about pdp status
+    _gs_send_at(GS_CMD_CGEREP, "=i", 2);
+    if (!_gs_wait_for_ok(500))
+        return 0;
+
     return 1;
 }
 
@@ -744,6 +728,7 @@ void _gs_handle_urc(GSCmd* cmd)
     uint8_t* buf = gs.buffer + p;
     uint8_t* ebuf = gs.buffer + gs.bytes;
     GSocket* sock;
+
     if (!p)
         return;
 
@@ -775,11 +760,11 @@ void _gs_handle_urc(GSCmd* cmd)
             //socket closed!
             _gs_parse_command_arguments(buf, ebuf, "si", &s0, &p0, &p1);
             _gs_socket_closing(p1);
-        } else if (p0 == 6 & memcmp(s0, "\"recv\"", p0) == 0) {
+        } else if (p0 == 6 && memcmp(s0, "\"recv\"", p0) == 0) {
             //data ready!
             _gs_parse_command_arguments(buf, ebuf, "si", &s0, &p0, &p1);
             _gs_socket_pending(p1);
-        } else if (p0 == 8 & memcmp(s0, "\"dnsgip\"", p0) == 0) {
+        } else if (p0 == 8 && memcmp(s0, "\"dnsgip\"", p0) == 0) {
             //dns ready!
             _gs_parse_command_arguments(buf, ebuf, "ss", &s0, &p0, &s1, &p1);
             if (s1[0] == '0') {
@@ -814,7 +799,11 @@ void _gs_handle_urc(GSCmd* cmd)
         break;
     case GS_CMD_CREG:
         //retrieve status of network registration
-        _gs_set_network_status_from_creg(buf, ebuf, 1);
+        _gs_set_gsm_status_from_creg(buf, ebuf, 1);
+        break;
+    case GS_CMD_CGREG:
+        //retrieve status of gprs network registration
+        _gs_set_gprs_status_from_cgreg(buf, ebuf, 1);
         break;
     case GS_CMD_CGEV:
         //retrieve status of pdp activation
@@ -839,7 +828,7 @@ void _gs_handle_urc(GSCmd* cmd)
 exit_ok:
     return;
 
-exit_err:;
+exit_err:
     printf("Error parsing arguments for %i\n", cmd->id);
     return;
 }
@@ -890,7 +879,7 @@ GSSlot* _gs_acquire_slot(int cmd_id, uint8_t* respbuf, int max_size, int timeout
 /**
  * @brief Wait until the main thread signal of slot completion
  */
-void _gs_wait_for_slot()
+void _gs_wait_for_slot(void)
 {
     vosSemWait(gs.slotdone);
 }
@@ -914,6 +903,7 @@ int _gs_wait_for_slot_mode(uint8_t* text, int32_t textlen, uint8_t* addtxt, int 
     //can be polled!
     int cnt = 0;
     printf("Waiting for mode\n");
+
     // vhalSerialWrite(gs.serial,">",1);
     while (gs.mode == GS_MODE_NORMAL && cnt < 100) { //after 10 seconds, timeout
         vosThSleep(TIME_U(100, MILLIS));
@@ -923,7 +913,7 @@ int _gs_wait_for_slot_mode(uint8_t* text, int32_t textlen, uint8_t* addtxt, int 
     if (gs.mode != GS_MODE_PROMPT)
         return -1;
     printf("Slot wait mode\n-->");
-    // print_buffer(text,textlen);
+    print_buffer(text,textlen);
     printf("\n");
 
     while (textlen > 0) {
@@ -949,7 +939,7 @@ int _gs_wait_for_slot_mode(uint8_t* text, int32_t textlen, uint8_t* addtxt, int 
     return 0;
 }
 
-int _gs_wait_for_buffer_mode()
+int _gs_wait_for_buffer_mode(void)
 {
     //can be polled!
     int cnt = 0;
@@ -1032,7 +1022,7 @@ void _gs_release_slot(GSSlot* slot)
 /**
  * @brief Signal the current slot as ok
  */
-void _gs_slot_ok()
+void _gs_slot_ok(void)
 {
     printf("ok slot %s\n", gs.slot->cmd->body);
     gs.slot->err = 0;
@@ -1043,7 +1033,7 @@ void _gs_slot_ok()
 /**
  * @brief Signal the current slot as error
  */
-void _gs_slot_error()
+void _gs_slot_error(void)
 {
     printf("error slot %s\n", gs.slot->cmd->body);
     gs.slot->err = GS_ERR_INVALID;
@@ -1054,7 +1044,7 @@ void _gs_slot_error()
 /**
  * @brief Signal the current slot as timed out
  */
-void _gs_slot_timeout()
+void _gs_slot_timeout(void)
 {
     printf("timeout slot %s\n", gs.slot->cmd->body);
     gs.slot->err = GS_ERR_TIMEOUT;
@@ -1107,11 +1097,13 @@ void _gs_loop(void* args)
     GSCmd* cmd;
     printf("_gs_loop started (Thread %d)\n", vosThGetId(vosThCurrent()));
     while (gs.initialized) {
+        // do nothing if serial is not active
         if (!gs.talking) {
-            //ignore if serial is not active
-            vosThSleep(TIME_U(1000, MILLIS));
+            gs.running = 0;
+            vosThSleep(TIME_U(500, MILLIS));
             continue;
         }
+        gs.running = 1;
         // printf("looping\n");
         if (gs.mode == GS_MODE_NORMAL) {
             if (_gs_readline(100) <= 3) {
@@ -1202,7 +1194,7 @@ void _gs_loop(void* args)
                         if (gs.slot->has_params == gs.slot->params) {
                             _gs_slot_ok();
                         } else {
-                            if (gs.slot->cmd->id == GS_CMD_CMGL) {
+                            if (gs.slot->cmd->id == GS_CMD_CMGL || gs.slot->cmd->id == GS_CMD_QENG) {
                                 //variable args
                                 _gs_slot_ok();
                             } else {
@@ -1242,7 +1234,7 @@ void _gs_loop(void* args)
                 // we have no slot
                 if (cmd) {
                     //we have a command
-                    if (cmd->urc | GS_CMD_URC) {
+                    if (cmd->urc & GS_CMD_URC) {
                         printf("Handling urc %s out of slot\n", cmd->body);
                         _gs_handle_urc(cmd);
                     } else {
@@ -1399,7 +1391,7 @@ int _gs_ssl_cfg(int op, int ctx, int val)
     slot = _gs_acquire_slot(GS_CMD_QSSLCFG, NULL, 0, GS_TIMEOUT * 5, 0);
     switch (op) {
     case 0:
-        _gs_send_at(GS_CMD_QSSLCFG, "=\"s\",i,3", "sslversion", 10, ctx); //select TLS 1.2 only
+        _gs_send_at(GS_CMD_QSSLCFG, "=\"s\",i,i", "sslversion", 10, ctx, val); //select TLS 1.2 only
         break;
     case 1:
         _gs_send_at(GS_CMD_QSSLCFG, "=\"s\",i,\"0XFFFF\"", "ciphersuite", 11, ctx); //select all secure ciphersuites
@@ -1465,8 +1457,7 @@ int _gs_socket_tls(int id, uint8_t* cacert, int cacertlen, uint8_t* clicert, int
     }
 
     res += _gs_ssl_cfg(5, ctx, authmode); //0 none, 1 server, 2 server+client
-    res += _gs_ssl_cfg(6, ctx, 0);        //set validity check
-    // res+=_gs_ssl_cfg(1,ctx,0); //set secure ciphersuites
+    res += _gs_ssl_cfg(6, ctx, 1);        //ignore time check
     vosSemSignal(sock->lock);
 
     return res;
@@ -1681,6 +1672,7 @@ int _gs_socket_close_nolock(int id){
     sock->acquired = 0;
     //unlock sockets waiting on rx
     vosSemSignal(sock->rx);
+    return res;
 }
 
 /**
@@ -1699,12 +1691,12 @@ int _gs_socket_close(int id)
     sock = &gs_sockets[id];
 
     vosSemWait(sock->lock);
-    _gs_socket_close_nolock(id);
+    /*res =*/ _gs_socket_close_nolock(id);
     vosSemSignal(sock->lock);
     return res;
 }
 
-void _gs_socket_close_all()
+void _gs_socket_close_all(void)
 {
     GSocket* sock;
     // GSSlot *slot;
@@ -1742,6 +1734,7 @@ int _gs_socket_send(int id, uint8_t* buf, int len)
         res = _gs_wait_for_slot_mode(buf, len, NULL, 0);
         if (res) {
             //ouch!
+            printf("OUCH %i\n", res);
         } else {
             res = len;
         }
@@ -2075,6 +2068,7 @@ recv_from_buf:
     }
     return res;
 }
+
 int _gs_socket_available(int id){
     GSocket* sock;
     int res;
@@ -2084,7 +2078,6 @@ int _gs_socket_available(int id){
     res = _gs_socket_available_nolock(id);
     vosSemSignal(sock->lock);
     return res;
-
 }
 
 int _gs_socket_available_nolock(int id)
@@ -2099,8 +2092,9 @@ int _gs_socket_available_nolock(int id)
     //read from buffer
     if (sock->len > 0){
         res = sock->len;
-    //} else if (sock->to_be_closed) {
-    //     res = ERR_CLSD;
+//WATCH OUT: the following 2 lines were commented out
+    } else if (sock->to_be_closed) {
+        res = ERR_CLSD;
     } else {
         if (sock->secure) {
             //QSSLRECV id,0 is not supported -_-
@@ -2151,7 +2145,7 @@ int _gs_socket_available_nolock(int id)
 
         _gs_wait_for_slot();
         if (slot->err) {
-            res = -1;
+            res = ERR_IF;
         }
         _gs_release_slot(slot);
     }
@@ -2167,8 +2161,8 @@ void _gs_socket_closing(int id)
     sock = &gs_sockets[id];
 
     // vosSemWait(sock->lock);
-    vosSemSignal(sock->rx);
     sock->to_be_closed = 1;
+    vosSemSignal(sock->rx);
     // vosSemSignal(sock->lock);
 }
 
@@ -2195,6 +2189,7 @@ int _gs_resolve(uint8_t* url, int len, uint8_t* addr)
     _gs_send_at(GS_CMD_QIDNSGIP, "=i,\"s\"", GS_PROFILE, url, len);
     _gs_wait_for_slot();
     if (slot->err) {
+        printf("SLOT ERROR\n");
         res = -1;
     }
     for (cnt = 0; cnt < 150; cnt++) {
@@ -2209,6 +2204,7 @@ int _gs_resolve(uint8_t* url, int len, uint8_t* addr)
         printf("copying from %x to %x %i bytes\n", gs.dnsaddr, addr, res);
         memcpy(addr, gs.dnsaddr, res);
     } else {
+        printf("DNS NOT READY\n");
         res = -1;
     }
     _gs_release_slot(slot);
@@ -2225,7 +2221,7 @@ int _gs_resolve(uint8_t* url, int len, uint8_t* addr)
  *
  * @return 0 on success
  */
-int _gs_list_operators()
+int _gs_list_operators(void)
 {
     GSSlot* slot;
     int err;
@@ -2298,60 +2294,49 @@ int _gs_set_operator(uint8_t* operator, int oplen)
     return err;
 }
 
-int _gs_set_network_status_from_creg(uint8_t* buf, uint8_t* ebuf, int from_urc)
+void _gs_update_network_status(uint8_t *s0, int l0, uint8_t *s1, int l1)
 {
-    int p0, p1, p2, l0, l1;
-    uint8_t *s0, *s1;
-    if (!from_urc) {
-        if (_gs_parse_command_arguments(buf, ebuf, "iiSSi", &p0, &p1, &s0, &l0, &s1, &l1, &p2) != 5) {
-            memset(gs.lac, 0, 10);
-            memset(gs.ci, 0, 10);
-            return -1;
-        } else {
-            l0 = MIN(9, l0);
-            memcpy(gs.lac, s0, l0);
-            gs.lac[l0] = 0;
-            l1 = MIN(9, l1);
-            memcpy(gs.ci, s1, l1);
-            gs.ci[l1] = 0;
-            gs.tech = p2;
-        }
-    } else {
-        //parse from urc
-        int nargs = _gs_parse_command_arguments(buf, ebuf, "iSSi", &p1, &s0, &l0, &s1, &l1, &p2);
-        if (nargs != 4) {
-            memset(gs.lac, 0, 10);
-            memset(gs.ci, 0, 10);
-        } else {
-            l0 = MIN(9, l0);
-            memcpy(gs.lac, s0, l0);
-            gs.lac[l0] = 0;
-            l1 = MIN(9, l1);
-            memcpy(gs.ci, s1, l1);
-            gs.ci[l1] = 0;
-            gs.tech = p2;
-        }
+    gs.tech = 0; // start with none
+    if (gs.gprs_status >= GS_REG_OK) {
+        if (gs.gprs_act == 2)
+            gs.tech |= GS_RAT_UMTS; // add UMTS
+        else
+            gs.tech |= GS_RAT_GPRS; // add GPRS
     }
+    if (gs.gsm_status >= GS_REG_OK)
+        gs.tech |= GS_RAT_GSM; // add GSM
+
+    if (gs.tech == 0) {
+        // neither GSM nor GPRS network is registered
+        memset(gs.lac, 0, 10);
+        memset(gs.ci, 0, 10);
+    } else if (s0 != NULL && s1 != NULL && l0 > 0 && l1 > 0) {
+        l0 = MIN(9, l0);
+        memcpy(gs.lac, s0, l0);
+        gs.lac[l0] = 0;
+        l1 = MIN(9, l1);
+        memcpy(gs.ci, s1, l1);
+        gs.ci[l1] = 0;
+    }
+
+    // update network status (data connection)
     int was_registered = gs.registered;
-    if (p1 == 1 || p1 == 5)
-        gs.registered = (p1 == 1) ? GS_REG_OK : GS_REG_ROAMING;
-    else if (p1 == 2 || p1 == 0)
-        gs.registered = GS_REG_NOT;
+    if (gs.tech & (GS_RAT_UMTS|GS_RAT_GPRS))
+        gs.registered = gs.gprs_status;
     else
-        gs.registered = GS_REG_DENIED;
+        gs.registered = GS_REG_NOT;
+
     // printf("status is %i %i %i\n",p1,gs.registered,was_registered);
 
     //Check registration status. With creg==0 or creg==2, we have no pdp even if no pdpdeact urc is issued.
     //Get the time of network status change and if it stays unreg too long, disconnect all sockets.
     //The behaviour upon losing network seems to be a +creg=2 urc, followed by a long time of retrying
     //to get the network. After some time (quite long), a creg=0 is issued followed by alternating creg=2 and creg=0.
-    if (
-        ((p1 == 1 || p1 == 5) && (was_registered == GS_REG_NOT || was_registered == GS_REG_DENIED))) {
+    if (gs.registered >= GS_REG_OK && was_registered < GS_REG_OK) {
         // printf("SET REGISTRATION STATUS TIME of reg\n");
         gs.registration_status_time = (uint32_t)(vosMillis() / 1000);
 
-    } else if (
-        ((p1 == 0 || p1 == 2) && (was_registered == GS_REG_OK || was_registered == GS_REG_ROAMING))) {
+    } else if (gs.registered < GS_REG_OK && was_registered >= GS_REG_OK) {
         //it is now registered but it wasn't before or viceversa: set registration status time in seconds
         // printf("SET REGISTRATION STATUS TIME of unreg\n");
         gs.registration_status_time = (uint32_t)(vosMillis() / 1000);
@@ -2364,17 +2349,85 @@ int _gs_set_network_status_from_creg(uint8_t* buf, uint8_t* ebuf, int from_urc)
         //set unreg time again
         // gs.registration_status_time = (uint32_t)(vosMillis() / 1000);
     // }
-    return p1;
 }
 
-int _gs_check_network()
+static const uint8_t reg_status[6] = {
+    GS_REG_NOT, GS_REG_OK, GS_REG_SEARCH, GS_REG_DENIED, GS_REG_UNKNOWN, GS_REG_ROAMING
+};
+
+int _gs_set_gsm_status_from_creg(uint8_t* buf, uint8_t* ebuf, int from_urc)
+{
+    int p0, p1, p2, l0, l1;
+    uint8_t *s0, *s1;
+
+    int nargs = 0;
+    if (!from_urc) {
+        nargs = _gs_parse_command_arguments(buf, ebuf, "iiSS", &p0, &p1, &s0, &l0, &s1, &l1);
+        nargs--; // discard p0
+    } else {
+        nargs = _gs_parse_command_arguments(buf, ebuf, "iSS", &p1, &s0, &l0, &s1, &l1);
+    }
+    if (nargs < 1) return 0;
+    //update gsm status
+    gs.gsm_status = reg_status[p1];
+
+    if (nargs < 3) {
+        s0 = s1 = NULL;
+        l0 = l1 = 0;
+    }
+    _gs_update_network_status(s0,l0,s1,l1);
+    return 1;
+}
+
+int _gs_set_gprs_status_from_cgreg(uint8_t* buf, uint8_t* ebuf, int from_urc)
+{
+    int p0, p1, p2, l0, l1;
+    uint8_t *s0, *s1;
+
+    int nargs = 0;
+    if (!from_urc) {
+        nargs = _gs_parse_command_arguments(buf, ebuf, "iiSSi", &p0, &p1, &s0, &l0, &s1, &l1, &p2);
+        nargs--; // discard p0
+    } else {
+        nargs = _gs_parse_command_arguments(buf, ebuf, "iSSi", &p1, &s0, &l0, &s1, &l1, &p2);
+    }
+    if (nargs < 1) return 0;
+    //update gprs status
+    gs.gprs_status = reg_status[p1];
+
+    if (nargs < 3) {
+        s0 = s1 = NULL;
+        l0 = l1 = 0;
+    }
+    if (nargs < 4)
+        gs.gprs_act = 1;
+    else
+        gs.gprs_act = p2;
+
+    _gs_update_network_status(s0,l0,s1,l1);
+    return 1;
+}
+
+/**
+ * @return 0 on failure (all commands)
+ */
+int _gs_check_network(void)
 {
     GSSlot* slot;
+    int res = 0;
+
     slot = _gs_acquire_slot(GS_CMD_CREG, NULL, 64, GS_TIMEOUT * 5, 1);
     _gs_send_at(GS_CMD_CREG, "?");
     _gs_wait_for_slot();
-    int res = _gs_set_network_status_from_creg(slot->resp, slot->eresp, 0);
+    res |= _gs_set_gsm_status_from_creg(slot->resp, slot->eresp, 0);
     _gs_release_slot(slot);
+
+    slot = _gs_acquire_slot(GS_CMD_CGREG, NULL, 64, GS_TIMEOUT * 5, 1);
+    _gs_send_at(GS_CMD_CGREG, "?");
+    _gs_wait_for_slot();
+    res |= _gs_set_gprs_status_from_cgreg(slot->resp, slot->eresp, 0);
+    _gs_release_slot(slot);
+
     return res;
 }
 
@@ -2456,7 +2509,7 @@ int _gs_get_rtc(uint8_t* time)
     return res;
 }
 
-int _gs_rssi()
+int _gs_rssi(void)
 {
     GSSlot* slot;
     int rssi = 99, ber;
@@ -2472,30 +2525,22 @@ int _gs_rssi()
 
     return rssi;
 }
-int _gs_attach(int attach)
-{
-    int res = 0;
-    //Attach to GPRS
-    GSSlot* slot;
-    slot = _gs_acquire_slot(GS_CMD_CGATT, NULL, 0, GS_TIMEOUT * 60 * 3, 0);
-    _gs_send_at(GS_CMD_CGATT, "=i", attach);
-    _gs_wait_for_slot();
-    res = slot->err;
-    _gs_release_slot(slot);
-    return res;
-}
 
-int _gs_is_attached()
+int _gs_is_attached(void)
 {
     int status = 0;
-    //Attached to GPRS?
+    // Read status of APN connection
+    int p0, p1;
     GSSlot* slot;
-    slot = _gs_acquire_slot(GS_CMD_CGATT, NULL, 32, GS_TIMEOUT * 60 * 3, 1);
-    _gs_send_at(GS_CMD_CGATT, "?");
+    slot = _gs_acquire_slot(GS_CMD_QIACT, NULL, 64, GS_TIMEOUT, 1);
+    _gs_send_at(GS_CMD_QIACT, "?");
     _gs_wait_for_slot();
     if (!slot->err) {
-        if (_gs_parse_command_arguments(slot->resp, slot->eresp, "i", &status) != 1) {
+        *slot->eresp = 0;
+        if (_gs_parse_command_arguments(slot->resp, slot->eresp, "ii", &p0, &p1) != 2) {
             status = 0;
+        } else {
+            status = p1;
         }
     }
     _gs_release_slot(slot);
@@ -2595,7 +2640,7 @@ int _gs_cell_info(int* mcc, int* mnc)
     int p0, l0, l1, l2;
     uint8_t *s0 = NULL, *s1 = NULL, *s2 = NULL, *s3 = NULL, *s4 = NULL;
     GSSlot* slot;
-    slot = _gs_acquire_slot(GS_CMD_QENG, NULL, 256, 5 * GS_TIMEOUT, 1);
+    slot = _gs_acquire_slot(GS_CMD_QENG, NULL, 256, 5 * GS_TIMEOUT, 27);
     _gs_send_at(GS_CMD_QENG, "=s", "\"servingcell\"", 13);
     _gs_wait_for_slot();
     if (!slot->err) {
@@ -2775,7 +2820,9 @@ int ug96_gzsock_recv(int sock, void *mem, size_t len, int flags){
     while(rb<len){
         trec = _gs_socket_recv(sock,buf+rb,len-rb);
         if(trec<0) {
-            if (trec==ERR_CLSD) return rb;
+            // when closed return data already read if any
+            if (trec==ERR_CLSD && rb > 0) return rb;
+            // otherwise error
             return trec;
         }
         rb+=trec;
