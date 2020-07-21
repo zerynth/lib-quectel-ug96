@@ -380,6 +380,11 @@ int _gs_sms_delete(int index);
 int _gs_sms_get_scsa(uint8_t* scsa);
 int _gs_sms_set_scsa(uint8_t* scsa, int scsalen);
 
+int ug96_gzsock_accept(int s, struct sockaddr *addr, socklen_t *addrlen);
+int ug96_gzsock_listen(int s, int backlog);
+int ug96_gzsock_ioctl(int s, long cmd, void *argp);
+int ug96_gzsock_inet_addr(const char *cp);
+int ug96_gzsock_inet_ntoa(struct in_addr *in);
 int ug96_gzsock_socket(int family, int type, int protocol);
 int ug96_gzsock_connect(int sock, const struct sockaddr *addr, socklen_t addrlen);
 int ug96_gzsock_setsockopt(int sock, int level, int optname, const void *optval, socklen_t optlen);

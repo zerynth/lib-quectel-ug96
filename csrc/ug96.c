@@ -2937,6 +2937,26 @@ int ug96_gzsock_shutdown(int s, int how) {
     return 0;
 }
 
+int ug96_gzsock_accept(int s, struct sockaddr *addr, socklen_t *addrlen) {
+    return 0;
+}
+
+int ug96_gzsock_listen(int s, int backlog) {
+    return 0;
+}
+
+int ug96_gzsock_ioctl(int s, long cmd, void *argp) {
+    return 0;
+}
+
+int ug96_gzsock_inet_addr(const char *cp) {
+    return 0;
+}
+
+int ug96_gzsock_inet_ntoa(struct in_addr *in) {
+    return 0;
+}
+
 int ug96_gzsock_getaddrinfo(const char *node, const char* service, const struct addrinfo *hints, struct addrinfo **res) {
     int32_t saddrlen;
     uint8_t saddr[16];
